@@ -1,0 +1,1655 @@
+---
+title: "Milk microbiome statistical analysis"
+author: "Alexandra Jazmin Roth Schulze"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    number_sections: yes
+    toc_float: yes
+  html_notebook:
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: "hide"
+urlcolor: blue
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r echo=FALSE}
+options(width = 90)
+```
+
+```{r ,include=FALSE}
+library(knitr)
+opts_chunk$set(comment = NA, warning=FALSE, message=FALSE, echo=TRUE, tidy=TRUE, tidy.opts=list(width.cutoff=60))
+library("ggplot2")
+theme_set(theme_bw())
+pal = "Set1"
+scale_colour_discrete <- function(palname = pal, ...) {
+    scale_colour_brewer(palette = palname, ...)
+}
+scale_fill_discrete <- function(palname = pal, ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+```
+
+
+```{r PackageLoad, tidy=TRUE, message=FALSE, warning=FALSE, echo=FALSE}
+Sys.setenv("R_REMOTES_NO_ERRORS_FROM_WARNINGS"=TRUE)
+library("ggplot2")
+library("Biostrings")
+library("kableExtra")
+library("limma")
+library("edgeR")
+library("car")
+library("vegan")
+library("phyloseq")
+library("glmmTMB")
+library("lme4")
+library("dplyr")
+library("emmeans")
+library("data.table")
+library("devtools")
+library("grid")
+library("stringr")
+library("ggpubr")
+```
+
+```{r RepeatedMeasureAwarePERMANOVAfunction, echo=FALSE}
+#@@@IMPORTANT, THIS WAS MODIFIED TO USE adonis2 --> there seems to be a problem with adonis check: https://github.com/joey711/phyloseq/issues/1457
+#Beta diversity function repeated-measure aware permutation
+## Function to perform PERMANOVA analysis with repeat measure-aware permutations 
+PERMANOVA_repeat_measures <- function(
+  D, permute_within, blocks = NULL, block_data, permutations=999,
+  metadata_order = c(names(permute_within), names(block_data)),
+  na.rm=F) {
+  
+  # Make sure D is a dist object
+  if (class(D) != "dist") {
+    stop("D must be a dist object")
+  }
+  
+  # Default to free permutations if blocks is not given
+  if (!missing(block_data) && is.null(blocks)) {
+    stop("blocks must be given if block_data is present")
+  } else if (is.null(blocks)) {
+    blocks <- rep(1, nrow(permute_within))
+    block_data <- as.data.frame(matrix(0, nrow=1, ncol=0))
+  } else if (length(unique(blocks)) == 1) {
+    warning("blocks only contains one unique value")
+  }
+  
+  # Ensure no metadata overlap between permute_within and block_data
+  if (length(intersect(names(permute_within), names(block_data))) > 0) {
+    stop("metadata is repeated across permute_within and block_data")
+  }
+  
+  # Ensure that metadata_order only contains stuff in permute_within and block_data
+  if(length(setdiff(metadata_order, union(names(permute_within), names(block_data)))) > 0) {
+    stop("metadata_order contains metadata not in permute_within and block_data")
+  }
+  
+  # Ensure that the data in permute_within matches that in dist
+  ord <- rownames(as.matrix(D))
+  if (length(ord) != nrow(permute_within) || length(blocks) != length(ord)) {
+    stop("blocks, permute_within, and D are not the same size")
+  }
+  if (is.null(rownames(permute_within))) {
+    warning("permute_within has no rownames - can't verify sample orders")
+  } else if (!all(ord == rownames(permute_within))) {
+    stop("rownames do not match between permute_within and D")
+  }
+  
+  # Ensure matching between blocks and block_data
+  if (any(is.na(blocks))) {
+    stop("NAs are not allowed in blocks")
+  }
+  if (is.factor(blocks)) {
+    if (length(levels(blocks)) != nrow(block_data)) {
+      stop("block_data does not have as many rows as blocks has levels")
+    }
+    if (!is.null(rownames(block_data)) && any(rownames(block_data) != levels(blocks))) {
+      stop("block_data rownames does not match the levels of blocks")
+    }
+    # Discard level information
+    blocks <- as.numeric(blocks)
+  } else if (is.numeric(blocks)) {
+    if (blocks < 1 || max(blocks) > nrow(block_data)) {
+      stop("Numeric blocks has indices out of range")
+    }
+  } else if (is.character(blocks)) {
+    if (is.null(rownames(block_data)) || !all(blocks %in% rownames(block_data))) {
+      stop("blocks does not match the rownames of block_data")
+    }
+    # Transform to numeric
+    blocks <- match(blocks, rownames(block_data))
+  } else {
+    stop("blocks must be a numeric, factor, or character vector")
+  }
+  
+  # Error out on NA metadata rather than allowing adonis to error out with
+  # a totally nonsensical error message
+  if (any(is.na(permute_within)) || any(is.na(block_data))) {
+    if (na.rm) {
+      n_prerm <- length(blocks)
+      
+      # Remove NAs in block_data
+      hasna <- (rowSums(is.na(block_data)) > 0) | (sapply(split(rowSums(is.na(permute_within)) > 0, blocks), mean) == 1)
+      block_data <- block_data[!hasna,, drop=F]
+      keep <- !hasna[blocks]
+      blocks <- cumsum(!hasna)[blocks]
+      
+      blocks <- blocks[keep]
+      permute_within <- permute_within[keep,, drop=F]
+      D <- as.matrix(D)[keep, keep]
+      # block_data is not subset, as the rows with NAs are no longer referenced in blocks
+      
+      # Remove NAs in permute_within
+      keep <- rowSums(is.na(permute_within)) == 0
+      blocks <- blocks[keep]
+      permute_within <- permute_within[keep,, drop=F]
+      D <- as.dist(D[keep, keep])
+      
+      if (length(blocks) < ncol(permute_within) + ncol(block_data)) {
+        stop(sprintf("After omitting samples with NAs, the number of samples (%d) is less than the number of metadata (%d)",
+                     length(blocks), ncol(permute_within) + ncol(block_data)))
+      } else if (length(blocks) < n_prerm * 0.5) {
+        warning(sprintf("Removed %d samples with NA metadata", n_prerm - length(blocks)))
+      }
+    } else {
+      stop("Some metadata is NA! adonis does not support any NA in the metadata")
+    }
+  }
+  
+  # Warn on some suspicious input
+  persample <- apply(permute_within, 1, function(x)is.factor(x) && !any(duplicated(x)))
+  if (any(persample)) {
+    warning(sprintf("%s in permute_within has one DOF per sample.", colnames(permute_within)[which(persample)[1]]))
+  }
+  if (length(unique(blocks)) < nrow(block_data)) {
+    warning("Not all blocks have a sample associated with them. Block permutations will still be performed over the full set of blocks - if this is not desired, subset block_data to only the blocks which appear in the data.")
+  }
+  if (!any(duplicated(blocks))) {
+    warning("blocks contains no duplicated elements")
+  }
+  
+  library(vegan)
+  library(permute)
+  
+  # Test statistic from non-permuted data
+  mtdat <- cbind(permute_within, block_data[blocks,,drop=F])
+  ad <- adonis2(D ~ ., permutations=0, data=mtdat[, metadata_order, drop=F])
+  R2 <- ad$R2
+  names(R2) <- rownames(ad)
+  
+  # Permutations
+  nullsamples <- matrix(NA, nrow=length(R2), ncol=permutations)
+  for (i in seq_len(permutations)) {
+    within.i <- shuffle(nrow(permute_within), control=how(blocks=blocks))
+    block.i <- sample(seq_len(nrow(block_data)))
+    mtdat <- cbind(
+      permute_within[within.i,,drop=F],
+      block_data[block.i,,drop=F][blocks,,drop=F])
+    perm.ad <- adonis2(D ~ ., permutations=0, data=mtdat[, metadata_order, drop=F])
+    
+    nullsamples[,i] <- perm.ad$R2
+  }
+  
+  # For residuals, test the other direction (i.e. p-value of all covariates)
+  n <- length(R2)
+  R2[n-1] <- 1 - R2[n-1]
+  nullsamples[n-1,] <- 1 - nullsamples[n-1,]
+  
+  # P value calculation similar to adonis's
+  exceedances <- rowSums(nullsamples > R2)
+  P <- (exceedances + 1) / (permutations + 1)
+  
+  P[n] <- NA    # No p-values for "Total"
+  ad$`Pr(>F)` <- P
+  
+  return (ad)
+}
+```
+
+```{r BetaTimeWithinT1DstatusFunction}
+pairwise_permanova_with_covariates <- function(
+  dist_mat,
+  metadata,
+  group_var,
+  covariates,
+  block_var = NULL,
+  permutations = 999
+) {
+  library(vegan)
+  
+  group_levels <- levels(metadata[[group_var]])
+  
+  results <- data.frame(
+    Group1 = character(),
+    Group2 = character(),
+    F_value = numeric(),
+    R2 = numeric(),
+    p_value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:(length(group_levels) - 1)) {
+    for (j in (i + 1):length(group_levels)) {
+      g1 <- group_levels[i]
+      g2 <- group_levels[j]
+      
+      sub_meta <- metadata[metadata[[group_var]] %in% c(g1, g2), ]
+      sub_meta[[group_var]] <- droplevels(sub_meta[[group_var]])
+      rownames(sub_meta) <- rownames(metadata)[metadata[[group_var]] %in% c(g1, g2)]
+      
+      # Skip if one of the groups has <2 samples
+      group_counts <- table(sub_meta[[group_var]])
+      if (any(group_counts < 2)) next
+      
+      # Subset distance matrix
+      sample_ids <- rownames(sub_meta)
+      sub_dist <- as.dist(as.matrix(dist_mat)[sample_ids, sample_ids])
+      
+      # Build formula
+      formula_terms <- paste(c(group_var, covariates), collapse = " + ")
+      adonis_formula <- as.formula(paste("sub_dist ~", formula_terms))
+      
+      # Permutation control
+      perm <- if (!is.null(block_var)) {
+        how(blocks = sub_meta[[block_var]])
+      } else {
+        permutations
+      }
+      
+      # Run adonis2 with error catching
+      tryCatch({
+        mod <- adonis2(
+          formula = adonis_formula,
+          data = sub_meta,
+          permutations = perm,
+          by = "margin"
+        )
+        
+        if (group_var %in% rownames(mod)) {
+          res <- mod[group_var, ]
+          results <- rbind(results, data.frame(
+            Group1 = g1,
+            Group2 = g2,
+            F_value = res$F,
+            R2 = res$R2,
+            p_value = res$`Pr(>F)`
+          ))
+        }
+      }, error = function(e) {
+        message(sprintf("Skipping comparison %s vs %s due to error: %s", g1, g2, e$message))
+      })
+    }
+  }
+  
+  results$padj <- p.adjust(results$p_value, method = "fdr")
+  return(results)
+}
+```
+
+```{r BetaTimeWithinT1DstatusFunction}
+pairwise_T1D_within_time <- function(
+  dist_mat,
+  metadata,
+  time_var = "Time_Corr",
+  group_var = "T1Dstatus",
+  covariates = NULL,
+  subject_id = NULL,
+  permutations = 999
+) {
+  library(vegan)
+  timepoints <- levels(metadata[[time_var]])
+  results <- data.frame()
+
+  for (tp in timepoints) {
+    sub_meta <- metadata[metadata[[time_var]] == tp, ]
+    if (nlevels(factor(sub_meta[[group_var]])) < 2) {
+      message(sprintf("Skipping timepoint %s: only one group level.", tp))
+      next
+    }
+    
+    rownames(sub_meta) <- rownames(metadata)[metadata[[time_var]] == tp]
+    sample_ids <- rownames(sub_meta)
+    sub_dist <- as.dist(as.matrix(dist_mat)[sample_ids, sample_ids])
+    
+    # Check if subject_id has repeated values at this timepoint
+    use_blocking <- !is.null(subject_id) && any(duplicated(sub_meta[[subject_id]]))
+
+    formula_terms <- paste(c(group_var, covariates), collapse = " + ")
+    adonis_formula <- as.formula(paste("sub_dist ~", formula_terms))
+    
+    perm <- if (use_blocking) {
+      how(blocks = sub_meta[[subject_id]])
+    } else {
+      permutations
+    }
+
+    tryCatch({
+      mod <- adonis2(
+        formula = adonis_formula,
+        data = sub_meta,
+        permutations = perm,
+        by = "margin"
+      )
+      res <- mod[group_var, , drop = FALSE]
+      res$Timepoint <- tp
+      results <- rbind(results, res)
+    }, error = function(e) {
+      message(sprintf("Skipping timepoint %s due to error: %s", tp, e$message))
+    })
+  }
+
+  results$padj <- p.adjust(results$`Pr(>F)`, method = "fdr")
+  return(results)
+}
+```
+
+```{r dataPrep, echo=FALSE, eval=FALSE}
+#This was run once so we don't need to run it again. I saved the resulting object and shared it 
+
+setwd("~/YOUR_DIRECTORY/")
+
+#import data for each of the 3 sequencing runs
+Milk_OTU11 <- load(file="./Run_11_Milk_Features_Phyloseq_Obj_Unfiltered.RData")
+Run_11 <- Mother_Milk_C11
+sample_names(Run_11)[2:4] <- c("KB_Run11_1", "KB_Run11_2", "KB_Run11_3")
+Run_11B <- subset_samples(Run_11, Sample.Type%in%c("Blank", "Kit Blank"))
+
+Milk_OTU16 <- load(file="./Run_16_Milk_Features_Phyloseq_Obj_Unfiltered.RData")
+Run_16 <- Mother_Milk_16
+sample_names(Run_16)[1:2] <- c("KB_Run16_1", "KB_Run16_2")
+
+Milk_OTU22 <- load(file="./Run_22_Milk_Features_Phyloseq_Obj_Unfiltered.RData")
+Run_22 <- Mother_Milk_C22
+sample_names(Run_22)[1:3] <- c("B_Run22_1", "B_Run22_2", "KB_Run22_1")
+Run_22B <- subset_samples(Run_22, Sample.Type%in%c("Blank", "Kit Blank"))
+
+Run_All_ASV <- merge_phyloseq(otu_table(Run_11), otu_table(Run_16), otu_table(Run_22))
+Run_All_Met <- merge_phyloseq(sample_data(Run_11), sample_data(Run_16), sample_data(Run_22))
+Run_All_Tax <- merge_phyloseq(tax_table(Run_11), tax_table(Run_16), tax_table(Run_22))
+#Import phylogenetic tree
+Phylogenetic_Tree <- read_tree("./rooted-tree_QMilk11_16_22.nwk") 
+#Import fasta sequences
+RefFasta <- readDNAStringSet("./rep-seqs-dada2_QMilk11_16_22.fasta")
+
+Mother_Milk_C <- phyloseq(otu_table(Run_All_ASV),  tax_table(Run_All_Tax), sample_data(Run_All_Met), phy_tree(Phylogenetic_Tree), refseq(RefFasta))
+Mother_Milk_ASV <- Mother_Milk_C
+
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 18156 taxa and 446 samples ]
+#sample_data() Sample Data:       [ 446 samples by 8 sample variables ]
+#tax_table()   Taxonomy Table:    [ 18156 taxa by 7 taxonomic ranks ]
+#phy_tree()    Phylogenetic Tree: [ 18156 tips and 17860 internal nodes ]
+#refseq()      DNAStringSet:      [ 18156 reference sequences ]
+
+###AGGLOMERATE BASED ON PHYLOGENETIC TREE TO "SPECIES" LEVEL
+Mother_Milk_OTU <- tip_glom(Mother_Milk_ASV, h = 0.03)
+Mother_Milk_OTU_Original <- Mother_Milk_OTU
+Mother_Milk_OTU_metadata <- read.table(file="./Metadata_Milk_Project_Updated_Formatted_Dic_2024_2.csv", fill=TRUE, header=TRUE, sep="\t", row.names=1)
+Mother_Milk_OTU <- phyloseq(otu_table(Mother_Milk_OTU_Original),  tax_table(Mother_Milk_OTU_Original), sample_data(Mother_Milk_OTU_metadata), phy_tree(Mother_Milk_OTU_Original))
+
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 6961 taxa and 446 samples ]
+#sample_data() Sample Data:       [ 446 samples by 8 sample variables ]
+#tax_table()   Taxonomy Table:    [ 6961 taxa by 7 taxonomic ranks ]
+#phy_tree()    Phylogenetic Tree: [ 6961 tips and 6960 internal nodes ]
+#refseq()      DNAStringSet:      [ 6961 reference sequences ]
+
+Mother_Milk_OTUM1 <-prune_taxa(taxa_sums(Mother_Milk_OTU)>=1, Mother_Milk_OTU)
+
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 1568 taxa and 446 samples ]
+#sample_data() Sample Data:       [ 446 samples by 35 sample variables ]
+#tax_table()   Taxonomy Table:    [ 1568 taxa by 7 taxonomic ranks ]
+#phy_tree()    Phylogenetic Tree: [ 1568 tips and 1567 internal nodes ]
+
+####################################################################
+##                                                               ###
+##                  ABUNDANCE FILTER                             ###
+##                                                               ###
+####################################################################
+
+Mother_Milk_OTU_dataframe <- as.data.frame(otu_table(Mother_Milk_OTUM1))
+
+# function to perform pre-filtering
+low.count.removal = function(data, percent=0.01)
+{
+  keep.otu = which(colSums(data)*100/(sum(colSums(data))) > percent)
+  data.filter = data[,keep.otu]
+  return(list(data.filter = data.filter, keep.otu = keep.otu))
+}
+
+result.filter = low.count.removal(Mother_Milk_OTU_dataframe, percent=0.01)
+length(result.filter$keep.otu) 
+Keep_OTUS <- names(result.filter$keep.otu)
+
+Mother_Milk_OTU_AFilt <- prune_taxa(Keep_OTUS, Mother_Milk_OTUM1)
+
+Mother_Milk_OTU_AFilt <- phyloseq(otu_table(Mother_Milk_OTU_AFilt),  sample_data(Mother_Milk_OTU_AFilt), tax_table(Mother_Milk_OTU_AFilt), phy_tree(Mother_Milk_OTU_AFilt), refseq(Mother_Milk_OTU_Original))
+  
+
+#phyloseq-class experiment-level object
+#otu_table()   OTU Table:         [ 154 taxa and 446 samples ]
+#sample_data() Sample Data:       [ 446 samples by 35 sample variables ]
+#tax_table()   Taxonomy Table:    [ 154 taxa by 7 taxonomic ranks ]
+#phy_tree()    Phylogenetic Tree: [ 154 tips and 153 internal nodes ]
+
+save(Mother_Milk_OTU_AFilt, file="./All_Runs_Milk_OTU_Phyloseq_Obj_Filter1.RData")
+```
+
+# Exploring contamination
+
+
+In this section we visualise the data before and after removing OTUs that were found in the blanks and kit blanks for all runs.
+
+Run 11 had 3 kit blanks that had sequences and no PCR blanks
+
+Run 16 had 2 kit blanks that had sequences and no PCR blanks
+
+Run 22 had 1 kit blank that had sequences and 2 PCR blanks
+
+
+```{r Contaminants, echo=FALSE}
+setwd("~/YOUR_DIRECTORY/")
+
+load(file="./All_Runs_Milk_OTU_Phyloseq_Obj_Filter1.RData")
+#Loads data "Mother_Milk_OTU_AFilt"
+
+#########   EXPLORING CONTAMINATION USING BLANKS ##############
+All_Blanks <- subset_samples(Mother_Milk_OTU_AFilt, Sample.Type%in%c("Blank", "Kit Blank"))
+All_Blanks <-prune_taxa(taxa_sums(All_Blanks)>=1, All_Blanks)
+
+#After removing OTUs with less than 1 sequence, samples B_Run22_1,  B_Run22_2 stay with 0 sequences, so we need to remove those samples previous to the analysis.
+All_Blanks <-prune_samples(sample_sums(All_Blanks)>=1, All_Blanks)
+
+Blank_taxa <- taxa_names(All_Blanks)
+#length(Blank_taxa)
+
+sample_data(All_Blanks)$Run <- as.factor(sample_data(All_Blanks)$Run)
+sample_data(All_Blanks)$Names <- sample_names(All_Blanks)
+
+
+ordination <- ordinate(All_Blanks, method="PCoA", distance="bray")
+#Plot ordination
+plot1<-plot_ordination(All_Blanks, ordination, type="samples", axes=c(1, 2),  color="Run", label = "Names")
+plot1rBlanks <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+
+#All_Blanks_PA <- phyloseq_standardize_otu_abundance(All_Blanks, method = "pa")
+
+#There are 24 otus in the different blanks and kit blanks. Most of them are present only in one of the blanks. However, 4 otus (463b2f0461c807f6f6a2ebd7bcff9c7a [Staphylococcus aureus], 68c762de4c38e7c746b650c04ab4ab6b [Moraxella osloensis] and c95030ff4d694df7892ad3c6f5db26b4 [Veillonella massiliensis] are present in 2 samples and two contaminant sequences (5945608ce1a916c2b42a3b59cc630a33 --> Streptococcus oralis [BLAST is classified 100% identity and cover] and 1aa3f21d6ab47eae35347ade1726f93e) have reads in 3 blanks 
+
+#Rmove non-bacterial contaminatns
+Mother_Milk_OTU_AFilt2 <- subset_samples(Mother_Milk_OTU_AFilt, Sample.Type%in%c("Breast Milk", "Breast milk"))
+Mother_Milk_OTU_AFilt2 <- subset_samples(Mother_Milk_OTU_AFilt2, Time_Corr != "NA")
+Mother_Milk_OTU_AFilt2 <- subset_taxa(Mother_Milk_OTU_AFilt2, Kingdom != "Unk")
+Mother_Milk_OTU_AFilt2 <- subset_taxa(Mother_Milk_OTU_AFilt2, Kingdom != "Unassigned")
+Mother_Milk_OTU_AFilt2 <- subset_taxa(Mother_Milk_OTU_AFilt2, Family != "mitochondria")
+Mother_Milk_OTU_AFilt2 <- subset_taxa(Mother_Milk_OTU_AFilt2, Genus != "Mitochondria")
+Mother_Milk_OTU_AFilt2 <- subset_taxa(Mother_Milk_OTU_AFilt2, Class != "Chloroplast")
+Mother_Milk_OTU_AFilt2 <- subset_taxa(Mother_Milk_OTU_AFilt2, Genus != "Chloroplast")
+Mother_Milk_OTU_AFilt2 <-prune_samples(sample_sums(Mother_Milk_OTU_AFilt2)>=1, Mother_Milk_OTU_AFilt2)
+
+#Plot ordination Before removing KIT contaminant OTUs
+sample_data(Mother_Milk_OTU_AFilt2)$Run <- as.factor(sample_data(Mother_Milk_OTU_AFilt2)$Run)
+ordination<-ordinate(Mother_Milk_OTU_AFilt2, method="PCoA", distance="bray")
+plot1<-plot_ordination(Mother_Milk_OTU_AFilt2, ordination, type="samples", axes=c(1, 2),  color="Run")
+plot1rBRemoving <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))  #+ ggtitle("Complete dataset before removing blanks or poor samples")#+ theme(legend.position='none')
+
+plot1<-plot_ordination(Mother_Milk_OTU_AFilt2, ordination, type="samples", axes=c(1, 2),  color="Time_Corr")
+plot1rBRemovingTime_Corr <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+
+###This step removes all OTUs (24) that are present in the blanks
+allTaxa = taxa_names(Mother_Milk_OTU_AFilt2)
+allTaxa_no_Blanks <- allTaxa[!(allTaxa %in% Blank_taxa)]
+Mother_Milk_C_M_BlankF <-prune_taxa(allTaxa_no_Blanks, Mother_Milk_OTU_AFilt2)
+Mother_Milk_C_Merged <- merge_samples(Mother_Milk_C_M_BlankF, "Merging")
+Mother_Milk_C_Merged <- phyloseq(otu_table(Mother_Milk_C_Merged),  tax_table(Mother_Milk_C_Merged), sample_data(Mother_Milk_C_M_BlankF))
+Mother_Milk_C_Merged <-prune_samples(sample_sums(Mother_Milk_C_Merged)>=1, Mother_Milk_C_Merged)
+
+#Plot ordination After removing contaminant OTUs
+sample_data(Mother_Milk_C_Merged)$Run <- as.factor(sample_data(Mother_Milk_C_Merged)$Run)
+ordination<-ordinate(Mother_Milk_C_Merged, method="PCoA", distance="bray")
+plot1<-plot_ordination(Mother_Milk_C_Merged, ordination, type="samples", axes=c(1, 2),  color="Run")
+plot1rARemoving <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+#Colored by Time_Corr
+plot1<-plot_ordination(Mother_Milk_C_Merged, ordination, type="samples", axes=c(1, 2),  color="Time_Corr")
+plot1rARemovingTime_Corr <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+
+Mother_Milk_C_MergedO <- Mother_Milk_C_Merged
+Mother_Milk_C_Merged <-prune_samples(sample_sums(Mother_Milk_C_Merged)>=1000, Mother_Milk_C_Merged)
+Mother_Milk_C_Merged <- subset_samples(Mother_Milk_C_Merged, Time_Corr!="NA")
+Mother_Milk_C_Merged <- subset_samples(Mother_Milk_C_Merged, Time_Corr!="V6")
+
+Mother_Milk_C_Merged #Contains samples that have more than 1000 sequences
+
+#Plot ordination after removing samples with less than 1000 sequences
+sample_data(Mother_Milk_C_Merged)$Run <- as.factor(sample_data(Mother_Milk_C_Merged)$Run)
+ordination<-ordinate(Mother_Milk_C_Merged, method="PCoA", distance="bray")
+plot1<-plot_ordination(Mother_Milk_C_Merged, ordination, type="samples", axes=c(1, 2),  color="Run")
+plot1000 <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+#By Time_Corr
+plot1<-plot_ordination(Mother_Milk_C_Merged, ordination, type="samples", axes=c(1, 2),  color="Time_Corr")
+plot1000Time_Corr <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+
+#Rarefy to 1000 sequences per sample
+Mother_Milk_C_M_R1000<-rarefy_even_depth(Mother_Milk_C_Merged, sample.size = 1000, rngseed = 711, replace=FALSE, trimOTUs = TRUE)
+
+Mother_Milk_C_M_R1000 #Contains samples rarefied to 1000 sequences
+
+#Plot ordination after rarefying samples to 1000 sequences per sample
+sample_data(Mother_Milk_C_M_R1000)$Run <- as.factor(sample_data(Mother_Milk_C_M_R1000)$Run)
+ordination<-ordinate(Mother_Milk_C_M_R1000, method="PCoA", distance="bray")
+plot1<-plot_ordination(Mother_Milk_C_M_R1000, ordination, type="samples", axes=c(1, 2),  color="Run")
+plot1Ra1000 <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+#By Time_Corr
+plot1<-plot_ordination(Mother_Milk_C_M_R1000, ordination, type="samples", axes=c(1, 2),  color="Time_Corr")
+plot1Ra1000Time_Corr <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))#+ theme(legend.position='none')
+#By T1D status
+sample_data(Mother_Milk_C_M_R1000)$T1Dstatus <- as.factor(sample_data(Mother_Milk_C_M_R1000)$T1Dstatus)
+plot1<-plot_ordination(Mother_Milk_C_M_R1000, ordination, type="samples", axes=c(1, 2),  color="T1Dstatus")
+plot1Ra1000T1D <- plot1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15))  + scale_fill_manual(values=c("blue", "red")) + scale_color_manual(values=c("blue", "red"))#+ theme(legend.position='none')
+
+#In order to know the number of subjects
+Mother_Milk_C_M_SMerged_TestSubject <- merge_samples(Mother_Milk_C_M_R1000, "SubjectID")
+#There are 124 different women/pregnancy and a total of 314 samples after filering OTUs found in the blanks and rarefying to 1000 (which removes samples below 1000 sequences)
+
+TableTime_CorrPoints <- table(sample_data(Mother_Milk_C_M_R1000)$Time_Corr)
+#B1 B2 V1 V2 V3 V4 V5 
+#32 62 67 56 45 23 12 
+
+TableTime_CorrPointsT1D <- table(sample_data(Mother_Milk_C_M_R1000)$Time_Corr, sample_data(Mother_Milk_C_M_R1000)$T1Dstatus)
+
+#      0  1
+#  B1 15 17
+#  B2 28 34
+#  V1 27 40
+#  V2 23 33
+#  V3 17 28
+#  V4 11 12
+#  V5  2 10
+
+T1Dcol <- c("blue", "red")
+
+sample_data(Mother_Milk_C_M_R1000)$Time_Corr <- as.factor(sample_data(Mother_Milk_C_M_R1000)$Time_Corr)
+sample_data(Mother_Milk_C_M_R1000)$T1Dstatus <- as.factor(sample_data(Mother_Milk_C_M_R1000)$T1Dstatus)
+sample_data(Mother_Milk_C_M_R1000)$Run <- as.factor(sample_data(Mother_Milk_C_M_R1000)$Run)
+sample_data(Mother_Milk_C_M_R1000)$biological_mother_id <- as.factor(sample_data(Mother_Milk_C_M_R1000)$biological_mother_id)
+```
+
+When ploting beta diversity of the complete dataset before removing blank OTUs or poor samples, we can see that there is a separation (not perfect) by sequencing run and that there is not a very good pattern in relation to the Time points.
+
+```{r CompBRemove, echo=FALSE, fig.height=6, fig.width=14}
+gridExtra::grid.arrange(plot1rBRemoving, plot1rBRemovingTime_Corr,  ncol = 2, top=textGrob("Complete dataset before removing blank OTUs and small samples",  gp = gpar(fontsize = 15, fontface = "bold", col = "blue")))
+```
+
+In total, there were 24 OTUs in all the blanks across sequencing runs. Those OTUs were removed from the complete dataset.
+
+```{r CompARemove, echo=FALSE, fig.height=6, fig.width=14}
+gridExtra::grid.arrange(plot1rARemoving, plot1rARemovingTime_Corr,  ncol = 2, top=textGrob("Complete dataset after removing blank OTUs",  gp = gpar(fontsize = 15, fontface = "bold", col = "blue")))
+```
+
+After removing the blank OTUs, we see that samples from different sequencing runs are mixed better. In the left side we see some samples from run 22 clustered together, but when we color samples by Time_Corr point we can see that those belong mostly to Time_Corr points B1 and B2.So, removing contaminant OTUs helps to observe Time_Corr point patterns better.
+
+```{r Comp1000, echo=FALSE, fig.height=6, fig.width=14}
+gridExtra::grid.arrange(plot1000, plot1000Time_Corr,  ncol = 2, top=textGrob("Complete dataset after removing blank OTUs and samples < 1000 seqs",  gp = gpar(fontsize = 15, fontface = "bold", col = "blue")))
+```
+
+In the plot, the sample reduction is evident, but they still form a pattern by Time point. This dataset will be used for differential abundance analysis, were information about library size per sample is needed by the statistical tools.
+
+```{r Comp1000RA, echo=FALSE, fig.height=6, fig.width=14}
+gridExtra::grid.arrange(plot1Ra1000, plot1Ra1000Time_Corr,  ncol = 2, top=textGrob("Complete dataset after removing blank OTUs and rarefying to 1000 seqs",  gp = gpar(fontsize = 15, fontface = "bold", col = "blue")))
+```
+
+This rarefied dataset will be used to perform alpha and beta diversity analyses, where normalization is essential specially when library sizes differ a lot. 
+
+Samples are distributed across Time points and women with and without T1D as follows:
+
+```{r DistributionSamples, echo=FALSE}
+kable(t(TableTime_CorrPointsT1D), caption="Sample distribution across Time_Corr points and T1D status") %>% kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "left")
+```
+
+Where 0: women without T1D and 1: women with T1D.
+
+
+# Taxonomic composition (Barplots)
+
+
+The following is a taxonomic bar plot of samples merged by T1D status
+
+```{r BarPlot, echo=FALSE, fig.height=10, fig.width=14}
+Personal_colors <- c("#FF0000", "#FFAA00", "#FFDD00", "#72d813", "#154f0d", "#06993E", "#06D8C3", "#06B2D8", "#004ECC", "#0300cc", "#6200CC", "#8E00CC", "#C500CC", "#CC0073", "#CC002C", "#BA8857", "#A04620", "#F47A00", "#771155","#AA4488", "#CC99BB", "#114477", "#4477AA", "#77AADD", "#381C00", "#781156","#A51876","#D21E96","#E43FAD", "#117845","#18A55E","#1ED278","#3FE491","#6CEAAB", "#FF7200")
+NName_Rel <- transform_sample_counts(Mother_Milk_C_M_R1000, function(x) 100 * x/sum(x))
+tax_table(NName_Rel)[,"Species"] <- taxa_names(NName_Rel)
+
+# Replace these with your actual object and variable names
+ps <- NName_Rel
+tax_level <- "Species"  # or "Phylum", "Family", etc.
+
+# Agglomerate at desired taxonomic level
+ps_tax <- tax_glom(ps, taxrank = tax_level)
+
+# Transform to relative abundance (optional)
+#ps_tax_rel <- transform_sample_counts(ps_tax, function(x) x / sum(x))
+
+# Extract data
+df <- psmelt(ps_tax)
+
+top_taxa <- df %>%
+  group_by(get(tax_level)) %>%
+  summarise(Total = sum(Abundance)) %>%
+  top_n(25, Total) %>%
+  pull(`get(tax_level)`)
+
+df_summary <- df %>%
+  filter(Species %in% top_taxa)
+
+#(1) compute mean relative abundance by timepoint, (2) make two barplots (women without T1D vs with T1D), and (3) force both plots to use the same taxon order learned from the women without T1D group. It also renames taxa to your preferred “OTU#. Genus” style.
+
+## 1) Summarize mean abundance by Time_Corr, T1Dstatus, and taxon
+df_summary2 <- df_summary %>%
+  group_by(t1dfactor, Time_Corr, Taxon = .data[[tax_level]]) %>%
+  summarise(Abundance = mean(Abundance), .groups = "drop")
+
+## (Optional) keep top N taxa overall to simplify the plot
+top_taxa <- df_summary %>%
+  group_by(Taxon = .data[[tax_level]]) %>%
+  summarise(Total = sum(Abundance), .groups = "drop") %>%
+  slice_max(Total, n = 25) %>%
+  pull(Taxon)
+
+df_summary3 <- df_summary2 %>% filter(Taxon %in% top_taxa)
+
+## 2) Derive the stacking/order from NON‑T1D only
+##    (change the value here to whatever label you use for “without T1D”)
+label_noT1D <- "nonT1D"   # e.g., "No T1D", "without T1D", etc.
+
+order_general <- df_summary3 %>%
+  group_by(Taxon) %>%
+  summarise(Total = sum(Abundance), .groups = "drop") %>%
+  arrange(desc(Total)) %>%
+  pull(Taxon)
+
+## 3) Create “OTU#. Genus” pretty labels based on that order
+##    Extract Genus from your current Taxon naming (e.g., "Genus_hash")
+extract_genus <- function(x) sub("\\..*$", "", x)
+
+pretty_labels <- setNames(paste0("OTU", seq_along(order_general), ". ", extract_genus(order_general)),order_general)
+  
+df_summary4 <- df_summary3 %>%
+mutate(Pretty_Label = pretty_labels[match(Taxon, names(pretty_labels))])
+
+
+## 4) Optional: consistent colors for the new pretty labels
+## If Personal_colors is named by ORIGINAL Taxon names:
+## pal <- Personal_colors[names(pretty_labels)]
+## names(pal) <- unname(pretty_labels)
+
+## If Personal_colors is unnamed (just a vector), reuse first K colors:
+pal <- Personal_colors[seq_along(pretty_labels)]
+df_summary4 <- df_summary4 %>%
+  mutate(Pretty_Label = factor(Pretty_Label, levels = pretty_labels))
+df_summary4$t1dfactor <- factor(df_summary4$t1dfactor,
+                                levels = c("nonT1D", "T1D"),
+                                labels = c("Mothers without T1D", "Mothers with T1D"))
+
+## 5) Plot: two panels by T1Dstatus, one bar per timepoint, same taxon order
+p <- ggplot(df_summary4, aes(x = Time_Corr, y = Abundance, fill = Pretty_Label)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(~ t1dfactor, ncol = 1) +   # two side-by-side plots
+  ylab("Relative Abundance") + xlab("Timepoint") +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 14, face = "bold"),
+    legend.text  = element_text(size = 12, face = "italic") ) + scale_fill_manual(name = "Taxa",
+  values = Personal_colors,
+  labels = function(x) parse(text = sapply(x, function(lbl) {
+    otu <- sub("\\..*$", "", lbl)  # e.g., OTU21
+    genus <- sub("^OTU\\d+\\.\\s*", "", lbl)  # e.g., Acinetobacter
+    paste0(otu, ".~italic('", genus, "')")
+  }))
+) + guides(fill = guide_legend(ncol = 1)) + theme(
+    axis.title.y = element_text(size = 15, face = "bold", color = "black"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 15, face = "bold", color = "black"),
+    axis.text.x  = element_text(size = 14, color = "black"),
+    strip.text   = element_text(size = 14, face = "bold")
+  )#scale_fill_manual(values = Personal_colors)
+p
+
+#Without separating by T1D status ir time
+df_collapsed <- df_summary4 %>%
+  group_by(Pretty_Label) %>%
+  summarise(Summed_Abundance = sum(Abundance, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(Relative_Abundance = Summed_Abundance / sum(Summed_Abundance))
+
+#Horizontal plot
+ggplot(df_collapsed, aes(x = reorder(Pretty_Label, Relative_Abundance),
+                         y = Relative_Abundance,
+                         fill = Pretty_Label)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  coord_flip() +
+  labs(x = NULL, y = "Relative Abundance") +
+  scale_fill_manual(
+    name = "Taxa",
+    values = Personal_colors,
+    labels = function(x) parse(text = sapply(x, function(lbl) {
+      otu <- sub("\\..*$", "", lbl)
+      genus <- sub("^OTU\\d+\\.\\s*", "", lbl)
+      paste0(otu, ".~italic('", genus, "')")
+    }))
+  ) +
+  guides(fill = guide_legend(ncol = 1)) +
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text  = element_text(size = 12),
+    axis.title.y = element_blank(),
+    axis.text.y  = element_text(size = 11),
+    axis.title.x = element_text(size = 14)
+  )# + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+##Vertical plot species 
+ggplot(df_collapsed, aes(x = "All Samples", y = Relative_Abundance, fill = Pretty_Label)) +
+  geom_bar(stat = "identity", width = 0.6)  +
+  scale_fill_manual(
+    name = "Taxa",
+    values = Personal_colors,
+    labels = function(x) parse(text = sapply(x, function(lbl) {
+      otu <- sub("\\..*$", "", lbl)
+      genus <- sub("^OTU\\d+\\.\\s*", "", lbl)
+      paste0(otu, ".~italic('", genus, "')")
+    }))
+  ) +
+  guides(fill = guide_legend(ncol = 1)) +
+  labs(x = NULL, y = "Relative Abundance") +
+  theme_minimal() +
+   theme(
+    axis.title.y = element_text(size = 15, face = "bold", color = "black"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.text.x  = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text  = element_text(size = 12)
+  ) # + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+#Phylum
+ps_phylum <- tax_glom(ps, taxrank = "Phylum")
+
+ps_phylum_rel <- transform_sample_counts(ps_phylum, function(x) x / sum(x))
+
+df_phylum <- psmelt(ps_phylum_rel)
+
+# Ensure Phylum is a clean character or factor vector
+df_phylum$Phylum <- as.character(df_phylum$Phylum)
+df_phylum$Phylum[is.na(df_phylum$Phylum)] <- "Unclassified"
+
+df_collapsed <- df_phylum %>%
+  group_by(Phylum) %>%
+  summarise(Relative_Abundance = sum(Abundance, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(Relative_Abundance = Relative_Abundance / sum(Relative_Abundance))
+
+df_collapsed <- df_collapsed %>%
+  mutate(Phylum = factor(Phylum, levels = Phylum[order(-Relative_Abundance)]))
+
+ggplot(df_collapsed, aes(x = "All Samples", y = Relative_Abundance, fill = Phylum)) +
+  geom_bar(stat = "identity", width = 0.6)  +
+  scale_fill_manual(
+    values = Personal_colors  # Optional: only if you're customizing phylum colors
+  ) +
+  labs(
+    x = NULL,
+    y = "Relative Abundance",
+    fill = "Phylum"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_text(size = 15, face = "bold", color = "black"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.text.x  = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text  = element_text(size = 12)
+  ) #+ scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+```
+
+# Alpha diversity analysis 
+
+## Observed richness
+
+```{r dummy, echo=FALSE}
+Dummy <- Mother_Milk_C_M_R1000
+```
+
+```{r AlphaTestObserved, echo=FALSE}
+##  Calculate observed and estimated richness as well as diversity indexes ###
+DivCal_R <- estimate_richness(Dummy, measures=c("Observed", "InvSimpson"))
+# make a data-frame with the 5 measures of richness/diversity and sample_data 
+sample_data(Dummy)$Time_Corr <- as.factor(sample_data(Dummy)$Time_Corr)
+DivCal_R_df <- data.frame(DivCal_R, sample_data(Dummy), check.rows  = F)
+DivCal_Sort <- arrange(DivCal_R_df, Time_Corr)
+
+#DELIVERY MODE
+DivCal_Sort$DeliveryMode <- case_when(
+  DivCal_Sort$mode_of_birth == "Caesarean (elective)" ~ "Elective Cesarean",
+  DivCal_Sort$mode_of_birth == "Caesarean (emergency)" ~ "Emergency Cesarean",
+  DivCal_Sort$mode_of_birth == "Spontaneous (normal)" ~ "Spontaneous Vaginal",
+  DivCal_Sort$mode_of_birth %in% c("Ventouse (normal)", "Forceps (normal)") ~ "Assisted Vaginal",
+  TRUE ~ NA_character_  # fallback for missing or unclassified values
+)
+
+# Convert to factor and set the order of levels
+DivCal_Sort$DeliveryMode <- factor(DivCal_Sort$DeliveryMode,
+                                    levels = c("Spontaneous Vaginal",
+                                               "Assisted Vaginal",
+                                               "Elective Cesarean",
+                                               "Emergency Cesarean"))
+
+#T1D STATUS
+t1d_label <- c(`no`="nonT1D", `yes`="T1D")
+DivCal_Sort$t1dfactor <- factor(DivCal_Sort$T1Dstatus, levels=c("0","1"), labels=c("nonT1D", "T1D"))
+
+##BMI CAT
+DivCal_Sort$BMI_Cat <- case_when(
+  DivCal_Sort$pre_preg_bmi < 25 ~ "Normal",
+  DivCal_Sort$pre_preg_bmi >= 25 & DivCal_Sort$pre_preg_bmi < 30 ~ "Overweight",
+  DivCal_Sort$pre_preg_bmi >= 30 ~ "Obese",
+  TRUE ~ NA_character_
+)
+
+# Set factor levels
+DivCal_Sort$BMI_Cat <- factor(DivCal_Sort$BMI_Cat, levels = c("Normal", "Overweight", "Obese"))
+
+##INFANT SEX ##
+DivCal_Sort$infant_sex <- factor(DivCal_Sort$infant_sex)
+
+##PARITY
+DivCal_Sort$ParityBinary <- factor(ifelse(DivCal_Sort$nulliparous == 1, 
+                                          "Nulliparous", 
+                                          "Multiparous"),
+                                   levels = c("Nulliparous", "Multiparous"))
+
+## Observed Richness
+
+#Data distribution
+ggplot(DivCal_R_df, aes(x = Observed)) +  geom_histogram(binwidth = 1, fill = "lightblue", color = "black") +  labs(title = "Histogram of Richness", x = "Observed", y = "Frequency")
+#Test normality
+shapiro.test(DivCal_R_df$Observed) #Not normal, more like NB
+
+#USING glmmTBM
+
+#Modeling Observed OTUs as the response variable, with T1D status and Time_Corr points as fixed effects and motherid and Run as a random effect.
+#The nbinom2 family is used for the Negative Binomial distribution with two parameters (mean and dispersion).
+
+# Fit a Negative Binomial model with subject-specific random intercepts
+set.seed(46)
+
+
+#compare models
+# Step 1: Define your full model (excluding random effects from the formula string for flexibility)
+fixed_effects <- "t1dfactor * Time_Corr + DeliveryMode + BMI_Cat + infant_sex + ParityBinary"
+
+# Step 2: Create list of individual terms (to test removal)
+terms_to_test <- c("DeliveryMode", "BMI_Cat", "infant_sex", "ParityBinary")  # keep DiabetesStatus and TimePoint always
+
+# Step 3: Fit full model
+full_model <- glmmTMB(
+  formula = as.formula(paste("Observed ~", fixed_effects, "+ (1 | biological_mother_id) + (1 | Run)")),
+  data = DivCal_Sort,
+  family = nbinom2()
+)
+
+# Step 4: Loop over variables, remove each one, fit reduced model, and compare AIC
+model_list <- list("Full Model" = full_model)
+aic_values <- data.frame(Model = "Full Model", AIC = AIC(full_model))
+
+for (term in terms_to_test) {
+  reduced_terms <- paste(setdiff(terms_to_test, term), collapse = " + ")
+  model_formula <- paste("Observed ~ t1dfactor * Time_Corr +", reduced_terms, "+ (1 | biological_mother_id) + (1 | Run)")
+  reduced_model <- glmmTMB(
+    formula = as.formula(model_formula),
+    data = DivCal_Sort,
+    family = nbinom2()
+  )
+  model_list[[paste("Minus", term)]] <- reduced_model
+  aic_values <- rbind(
+    aic_values,
+    data.frame(Model = paste("Minus", term), AIC = AIC(reduced_model))
+  )
+}
+
+# Step 5: View AIC results
+aic_values <- aic_values %>% arrange(AIC)
+print(aic_values)
+
+#              Model      AIC
+#1      Minus BMI_Cat 1901.714
+#2   Minus infant_sex 1902.347
+#3 Minus ParityBinary 1902.637
+#4 Minus DeliveryMode 1903.016
+#5         Full Model 1904.286
+
+#A lower AIC indicates a better-fitting model, therefore we remove BMI_Cat from the model
+
+richness_model <- glmmTMB(Observed ~ Time_Corr*t1dfactor  + DeliveryMode +  infant_sex + ParityBinary + (1 | biological_mother_id) + (1 | Run), data = DivCal_Sort, family = nbinom2())
+
+summary(richness_model)
+Anova(richness_model, type = "III") # --> There is interaction between T1D status and timepoint
+
+#Note: since the interaction between T1D status and Time_Corr point is significant, that means that the effect of T1D status on Observed OTUs varies across the different Time_Corr points
+
+#Since we had significant interaction effects, we perform post-hoc tests to explore the pairwise comparisons between levels of T1D status across different Time_Corr points.
+# Perform pairwise comparisons for the interaction between T1D_status and Time_Corr_point were we are interested about Time_Corr
+set.seed(46)
+emm1 <- emmeans(richness_model, pairwise ~ Time_Corr | t1dfactor)
+ROPH1 <- summary(emm1$contrasts, type = "response", infer = TRUE, adjust = "fdr")
+
+AlphaPairTime_Corr_DF <- data.frame(T1Dstatus=character(), Comparison=character(), Pvalue=numeric(), Estimate=numeric(), LCI=numeric(), UCI=numeric(), stringsAsFactors=FALSE) 
+AlphaPairTime_Corr_DF[1,c(1:6)] = c("Non-T1D", "B1 vs B2", round(ROPH1$p.value[1],3), ROPH1$ratio[1], ROPH1$asymp.LCL[1], ROPH1$asymp.UCL[1])
+AlphaPairTime_Corr_DF[2,c(1:6)] = c("Non-T1D", "B2 vs V1", round(ROPH1$p.value[7],3), ROPH1$ratio[7], ROPH1$asymp.LCL[7], ROPH1$asymp.UCL[7])
+AlphaPairTime_Corr_DF[3,c(1:6)] = c("Non-T1D", "V1 vs V2", round(ROPH1$p.value[12],3), ROPH1$ratio[12], ROPH1$asymp.LCL[12], ROPH1$asymp.UCL[12])
+AlphaPairTime_Corr_DF[4,c(1:6)] = c("Non-T1D", "V2 vs V3", round(ROPH1$p.value[16],3), ROPH1$ratio[16], ROPH1$asymp.LCL[16], ROPH1$asymp.UCL[16])
+AlphaPairTime_Corr_DF[5,c(1:6)] = c("Non-T1D", "V3 vs V4", round(ROPH1$p.value[19],3), ROPH1$ratio[19], ROPH1$asymp.LCL[19], ROPH1$asymp.UCL[19])
+AlphaPairTime_Corr_DF[6,c(1:6)] = c("Non-T1D", "V4 vs V5", round(ROPH1$p.value[21],3), ROPH1$ratio[21], ROPH1$asymp.LCL[21], ROPH1$asymp.UCL[21])
+AlphaPairTime_Corr_DF[7,c(1:6)] = c("T1D", "B1 vs B2", round(ROPH1$p.value[22],3), ROPH1$ratio[22], ROPH1$asymp.LCL[22], ROPH1$asymp.UCL[22])
+AlphaPairTime_Corr_DF[8,c(1:6)] = c("T1D", "B2 vs V1", round(ROPH1$p.value[28],3), ROPH1$ratio[28], ROPH1$asymp.LCL[28], ROPH1$asymp.UCL[28])
+AlphaPairTime_Corr_DF[9,c(1:6)] = c("T1D", "V1 vs V2", round(ROPH1$p.value[33],3), ROPH1$ratio[33], ROPH1$asymp.LCL[33], ROPH1$asymp.UCL[33])
+AlphaPairTime_Corr_DF[10,c(1:6)] = c("T1D", "V2 vs V3", round(ROPH1$p.value[37],3), ROPH1$ratio[37], ROPH1$asymp.LCL[37], ROPH1$asymp.UCL[37])
+AlphaPairTime_Corr_DF[11,c(1:6)] = c("T1D", "V3 vs V4", round(ROPH1$p.value[40],3), ROPH1$ratio[40], ROPH1$asymp.LCL[40], ROPH1$asymp.UCL[40])
+AlphaPairTime_Corr_DF[12,c(1:6)] = c("T1D", "V4 vs V5", round(ROPH1$p.value[42],3), ROPH1$ratio[42], ROPH1$asymp.LCL[42], ROPH1$asymp.UCL[42])
+
+# Perform pairwise comparisons for the interaction between T1D_status and Time_Corr_point
+emm2 <- emmeans(richness_model, pairwise ~ t1dfactor | Time_Corr)
+# View the results of pairwise comparisons
+ROPH2 <- summary(emm2$contrasts, type = "response", infer = TRUE, adjust = "fdr")
+
+#print(kable(ROPH$contrasts, caption="Differences is observed richness due to T1D status in each Time_Corr point (Pairwise)") %>% kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "left"))
+OT1DsB1 <- ROPH$contrasts$p.value[1]
+OT1DsB2 <- ROPH$contrasts$p.value[2]
+#Differences in observed richness due to T1D status are significant only in Time_Corrpoints B1 and B2.
+```
+
+### Observed richness plots - Time_Corr points divided by T1D status 
+
+```{r AlphaPlotO, echo=FALSE, fig.height=4, fig.width=10}
+# Extract adjusted estimated means from emmeans
+emm_df <- as.data.frame(summary(emm$emmeans, type = "response", infer = TRUE))
+#Plot
+Richness <- ggplot(emm_df, aes(x = Time_Corr, y = response, color = t1dfactor, fill = t1dfactor)) + geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = 0.15, position = position_dodge(width = 0.3), size=1.5) + geom_point(position = position_dodge(width = 0.3), size = 2.5, shape = 21, stroke = 1.1, fill = "white") + scale_color_manual(values = c("nonT1D" = "blue", "T1D" = "red"), guide = "none") + scale_fill_manual(values = c("nonT1D" = "blue", "T1D" = "red"), guide = "none") + labs(x = NULL,  y = "Estimated Richness") +  theme_minimal(base_size = 14) + theme(axis.text.x = element_text(size = 15, color = "black"), axis.text.y = element_text(size = 15, color = "black"), panel.grid.major = element_blank(),  panel.grid.minor = element_blank(),  axis.line.x = element_line(size = 0.8, color = "black"), axis.line.y = element_line(size = 0.8, color = "black"),  panel.border = element_blank(),   plot.title = element_blank(), axis.ticks = element_line() ) + geom_text(aes(x = 1.5, y = 11, label = "***"), size = 8, color = "blue", fontface = "bold") + geom_text(aes(x = 2, y = 18, label = "**"), size = 8, color = "black", fontface = "bold") + geom_text(aes(x = 2.5, y = 11, label = "**"), size = 8, color = "red", fontface = "bold") + geom_text(aes(x = 5.5, y = 18, label = "**"), size = 8, color = "red", fontface = "bold")
+```
+
+Black asterisks: Differences between women with and without T1D
+
+Blue asterisks: Differences between Time_Corr points in women without T1D
+
+Red asterisks: Differences between Time_Corr points in women with T1D
+
+## Inverted Simpson index
+
+```{r AlphaTestInvSimpson, echo=FALSE}
+#Data distribution
+ggplot(DivCal_Sort, aes(x = InvSimpson)) +  geom_histogram(binwidth = 1, fill = "lightblue", color = "black") +  labs(title = "Histogram of Richness", x = "InvSimpson", y = "Frequency")
+#Test normality
+shapiro.test(DivCal_Sort$InvSimpson)
+
+# Fit a Negative Binomial model with subject-specific random intercepts
+set.seed(46)
+InvSimpson_model <- glmmTMB(InvSimpson ~ Time_Corr*t1dfactor  + DeliveryMode +  infant_sex + ParityBinary + (1 | biological_mother_id) + (1 | Run), data = DivCal_Sort, family = Gamma(link = "log"))
+summary(InvSimpson_model)
+Anova(InvSimpson_model, type = "III") # --> There is interaction between T1D status and timepoint
+
+#Note: since the interaction between T1D status and Time_Corr point is significant, that means that the effect of T1D status on Observed OTUs varies across the different Time_Corr points
+
+#Since we had significant interaction effects, we perform post-hoc tests to explore the pairwise comparisons between levels of T1D status across different Time_Corr points.
+# Perform pairwise comparisons for the interaction between T1D_status and Time_Corr_point were we are interested about Time_Corr
+set.seed(46)
+emmIS1 <- emmeans(InvSimpson_model, pairwise ~ Time_Corr | t1dfactor)
+ROPHIS1 <- summary(emmIS1$contrasts, type = "response", infer = TRUE, adjust = "fdr")
+
+AlphaPairTime_CorrIS_DF <- data.frame(T1Dstatus=character(), Comparison=character(), Pvalue=numeric(), Estimate=numeric(), LCI=numeric(), UCI=numeric(), stringsAsFactors=FALSE) 
+AlphaPairTime_CorrIS_DF[1,c(1:6)] = c("Non-T1D", "B1 vs B2", round(ROPHIS1$p.value[1],3), ROPHIS1$ratio[1], ROPHIS1$asymp.LCL[1], ROPHIS1$asymp.UCL[1])
+AlphaPairTime_CorrIS_DF[2,c(1:6)] = c("Non-T1D", "B2 vs V1", round(ROPHIS1$p.value[7],3), ROPHIS1$ratio[7], ROPHIS1$asymp.LCL[7], ROPHIS1$asymp.UCL[7])
+AlphaPairTime_CorrIS_DF[3,c(1:6)] = c("Non-T1D", "V1 vs V2", round(ROPHIS1$p.value[12],3), ROPHIS1$ratio[12], ROPHIS1$asymp.LCL[12], ROPHIS1$asymp.UCL[12])
+AlphaPairTime_CorrIS_DF[4,c(1:6)] = c("Non-T1D", "V2 vs V3", round(ROPHIS1$p.value[16],3), ROPHIS1$ratio[16], ROPHIS1$asymp.LCL[16], ROPHIS1$asymp.UCL[16])
+AlphaPairTime_CorrIS_DF[5,c(1:6)] = c("Non-T1D", "V3 vs V4", round(ROPHIS1$p.value[19],3), ROPHIS1$ratio[19], ROPHIS1$asymp.LCL[19], ROPHIS1$asymp.UCL[19])
+AlphaPairTime_CorrIS_DF[6,c(1:6)] = c("Non-T1D", "V4 vs V5", round(ROPHIS1$p.value[21],3), ROPHIS1$ratio[21], ROPHIS1$asymp.LCL[21], ROPHIS1$asymp.UCL[21])
+AlphaPairTime_CorrIS_DF[7,c(1:6)] = c("T1D", "B1 vs B2", round(ROPHIS1$p.value[22],3), ROPHIS1$ratio[22], ROPHIS1$asymp.LCL[22], ROPHIS1$asymp.UCL[22])
+AlphaPairTime_CorrIS_DF[8,c(1:6)] = c("T1D", "B2 vs V1", round(ROPHIS1$p.value[28],3), ROPHIS1$ratio[28], ROPHIS1$asymp.LCL[28], ROPHIS1$asymp.UCL[28])
+AlphaPairTime_CorrIS_DF[9,c(1:6)] = c("T1D", "V1 vs V2", round(ROPHIS1$p.value[33],3), ROPHIS1$ratio[33], ROPHIS1$asymp.LCL[33], ROPHIS1$asymp.UCL[33])
+AlphaPairTime_CorrIS_DF[10,c(1:6)] = c("T1D", "V2 vs V3", round(ROPHIS1$p.value[37],3), ROPHIS1$ratio[37], ROPHIS1$asymp.LCL[37], ROPHIS1$asymp.UCL[37])
+AlphaPairTime_CorrIS_DF[11,c(1:6)] = c("T1D", "V3 vs V4", round(ROPHIS1$p.value[40],3), ROPHIS1$ratio[40], ROPHIS1$asymp.LCL[40], ROPHIS1$asymp.UCL[40])
+AlphaPairTime_CorrIS_DF[12,c(1:6)] = c("T1D", "V4 vs V5", round(ROPHIS1$p.value[42],3), ROPHIS1$ratio[42], ROPHIS1$asymp.LCL[42], ROPHIS1$asymp.UCL[42])
+
+#In women without T1D comparisons B2 vs V1 and V1 vs V2 are significantly different
+
+#Differences due to T1D status in diferent Time_Corrpoints
+# Perform pairwise comparisons for the interaction between T1D_status and Time_Corr_point
+emmIS2 <- emmeans(InvSimpson_model, pairwise ~ t1dfactor | Time_Corr)
+# View the results of pairwise comparisons
+ROPHIS2 <- summary(emmIS2$contrasts, type = "response", infer = TRUE, adjust = "fdr")
+```
+
+### Inverted Simpson plots - Time_Corr points divided by T1D status 
+
+```{r AlphaPlotI, echo=FALSE, fig.height=4, fig.width=10}
+# Extract adjusted estimated means from emmeans
+emmIS_df <- as.data.frame(summary(emmIS1$emmeans, type = "response", infer = TRUE))
+#Plot
+InvSimpson <- ggplot(emmIS_df, aes(x = Time_Corr, y = response, color = t1dfactor, fill = t1dfactor)) + geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = 0.15, position = position_dodge(width = 0.3), size=1.5) + geom_point(position = position_dodge(width = 0.3), size = 2.5, shape = 21, stroke = 1.1, fill = "white") + scale_color_manual(values = c("nonT1D" = "blue", "T1D" = "red"), guide = "none") + scale_fill_manual(values = c("nonT1D" = "blue", "T1D" = "red"), guide = "none") + labs(x = NULL,  y = "Estimated Richness") +  theme_minimal(base_size = 14) + theme(axis.text.x = element_text(size = 15, color = "black"), axis.text.y = element_text(size = 15, color = "black"), panel.grid.major = element_blank(),  panel.grid.minor = element_blank(),  axis.line.x = element_line(size = 0.8, color = "black"), axis.line.y = element_line(size = 0.8, color = "black"),  panel.border = element_blank(),   plot.title = element_blank(), axis.ticks = element_line() ) + geom_text(aes(x = 2, y = 4, label = "**"), size = 8, color = "black", fontface = "bold")  + geom_text(aes(x = 2.5, y = 3, label = "***"), size = 8, color = "red", fontface = "bold") + geom_text(aes(x = 4, y = 5.5, label = "*"), size = 8, color = "black", fontface = "bold") + geom_text(aes(x = 4.5, y = 4, label = "**"), size = 8, color = "blue", fontface = "bold") + geom_text(aes(x = 4.5, y = 4.5, label = "**"), size = 8, color = "red", fontface = "bold")
+
+##Create figure 2
+ComposedF2 <- ggarrange(Richness, InvSimpson, ncol=2, labels = c("a", "b"), font.label = list(size = 20))
+```
+
+Black asterisks: Differences between women with and without T1D
+
+Blue asterisks: Differences between Time_Corr points in women without T1D
+
+Red asterisks: Differences between Time_Corr points in women with T1D
+
+
+# Beta diversity analysis
+
+```{r BetaDiversity, echo=FALSE, fig.height=4, fig.width=10}
+# Extract sample data as a data frame
+OTU_Plot <- transform_sample_counts(Mother_Milk_C_M_R1000, function(x) 100 * x/sum(x))
+OTU_Plot <- transform_sample_counts(OTU_Plot, function(x) log(1 + x) )
+sample_data_df <- as.data.frame(sample_data(OTU_Plot))
+
+# Recode mode_of_birth into a new factor DeliveryMode
+sample_data_df$DeliveryMode <- case_when(
+  sample_data_df$mode_of_birth == "Caesarean (elective)" ~ "Elective Cesarean",
+  sample_data_df$mode_of_birth == "Caesarean (emergency)" ~ "Emergency Cesarean",
+  sample_data_df$mode_of_birth == "Spontaneous (normal)" ~ "Spontaneous Vaginal",
+  sample_data_df$mode_of_birth %in% c("Ventouse (normal)", "Forceps (normal)") ~ "Assisted Vaginal",
+  TRUE ~ NA_character_  # fallback for missing or unclassified values
+)
+
+# Convert to factor and set the order of levels
+sample_data_df$DeliveryMode <- factor(sample_data_df$DeliveryMode,
+                                    levels = c("Spontaneous Vaginal",
+                                               "Assisted Vaginal",
+                                               "Elective Cesarean",
+                                               "Emergency Cesarean"))
+
+#T1D STATUS
+t1d_label <- c(`no`="nonT1D", `yes`="T1D")
+sample_data_df$t1dfactor <- factor(sample_data_df$T1Dstatus, levels=c("0","1"), labels=c("nonT1D", "T1D"))
+
+##BMI CAT
+sample_data_df$BMI_Cat <- cut(sample_data_df$pre_preg_bmi, breaks = c(-Inf,18,25,30,Inf), labels = c("Underweight", "Normal","Overweight", "Obese"))
+sample_data_df$BMI_Cat <- as.factor(sample_data_df$BMI_Cat)
+#sample_data_df <- subset(sample_data_df, BMI_Cat!="NA")
+##INFANT SEX ##
+sample_data_df$infant_sex <- factor(sample_data_df$infant_sex)
+
+##PARITY
+sample_data_df$ParityBinary <- factor(ifelse(sample_data_df$nulliparous == 1, 
+                                          "Nulliparous", 
+                                          "Multiparous"),
+                                   levels = c("Nulliparous", "Multiparous"))
+
+#convert selected variables into factors 
+vars_to_factor <- c("t1dfactor", "Time_Corr", "BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex")
+
+# Convert selected variables to factors if they exist in the data frame
+for (var in vars_to_factor) {
+  if (var %in% colnames(sample_data_df)) {
+    sample_data_df[[var]] <- as.factor(sample_data_df[[var]])
+  }
+}
+
+sample_data_df <- sample_data_df[, c("t1dfactor", "Time_Corr", "BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex", "Run", "T1Dstatus", "biological_mother_id")]
+
+# Assign back to phyloseq object
+sample_data(OTU_Plot) <- sample_data(sample_data_df)
+taxa_names(OTU_Plot) <- paste(tax_table(OTU_Plot)[,"Genus"], taxa_names(OTU_Plot), sep=".")
+
+# Aggregate at each taxonomic level
+ps_levels <- list(
+  Genus   = tax_glom(OTU_Plot, taxrank = "Genus",   NArm = TRUE),
+  Family  = tax_glom(OTU_Plot, taxrank = "Family",  NArm = TRUE),
+  Order   = tax_glom(OTU_Plot, taxrank = "Order",   NArm = TRUE),
+  Phylum  = tax_glom(OTU_Plot, taxrank = "Phylum",  NArm = TRUE)
+)
+
+# Update taxa_names to reflect the collapsed taxonomic level
+for (level in names(ps_levels)) {
+  tax_table_obj <- tax_table(ps_levels[[level]])
+  
+  # If that level exists in the tax table
+  if (level %in% colnames(tax_table_obj)) {
+    new_names <- as.character(tax_table_obj[, level])
+    
+    # Replace NA or empty names with generic placeholders to avoid errors
+    new_names[is.na(new_names) | new_names == ""] <- paste0("Unclassified_", level, "_", seq_along(new_names[is.na(new_names) | new_names == ""]))
+    
+    # Apply new names
+    taxa_names(ps_levels[[level]]) <- new_names
+  } else {
+    warning(paste("Level", level, "not found in tax_table"))
+  }
+}
+
+##Species
+#nonT1D
+SubNT1D <- subset_samples(OTU_Plot, t1dfactor==c("nonT1D"))
+NDT1D <- phyloseq::distance(SubNT1D, method="bray")
+Meta_dfNT1D <- data.frame(sample_data(SubNT1D), check.names = FALSE)
+
+set.seed(36)
+resultsNT1D <- pairwise_permanova_with_covariates(
+  dist_mat = NDT1D,
+  metadata = Meta_dfNT1D,
+  group_var = "Time_Corr",
+  covariates = c("BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex", "Run")
+  # block_var not provided
+)
+resultsNT1D
+resultsNT1DT <- resultsNT1D[c(1,7, 12, 16, 19, 21),]
+rownames(resultsNT1DT) <- c(1, 2, 3, 4, 5, 6)
+
+#Package used to calculate 95%CI for R2
+library("psychometric")
+#Calculate CI 95%
+for(p in 1:nrow(resultsNT1DT)){
+resultsNT1DT[p,c("2.5%", "97.5%")] <- (CI.Rsq((round(resultsNT1DT[p,"R2"]*100,1)), n=123, k=6))[c(3:4)]
+#Where n is the number of samples in the comparison and k is the number of predictors
+}
+
+#T1D
+SubT1D <- subset_samples(OTU_Plot, t1dfactor==c("T1D"))
+DT1D <- phyloseq::distance(SubT1D, method="bray")
+Meta_dfT1D <- data.frame(sample_data(SubT1D), check.names = FALSE)
+
+set.seed(36)
+resultsT1D <- pairwise_permanova_with_covariates(
+  dist_mat = DT1D,
+  metadata = Meta_dfT1D,
+  group_var = "Time_Corr",
+  covariates = c("BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex", "Run")
+  # block_var not provided
+)
+print(resultsT1D)
+resultsT1DT <- resultsT1D[c(1,7, 12, 16, 19, 21),]
+rownames(resultsT1DT) <- c(1, 2, 3, 4, 5, 6)
+
+#Calculate CI 95%
+for(p in 1:nrow(resultsT1DT)){
+resultsT1DT[p,c("2.5%", "97.5%")] <- (CI.Rsq((round(resultsT1DT[p,"R2"]*100,1)), n=174, k=6))[c(3:4)]
+#Where n is the number of samples in the comparison and k is the number of predictors
+}
+
+
+###PLOTS
+#Non T1D
+ordination_OTU<-ordinate(SubNT1D, method="PCoA", distance="bray", ~  Time_Corr)
+p_OTU1<-plot_ordination(OTU_Plot, ordination_OTU, type="samples",  color="Time_Corr", axes = c(1, 2))
+PlotNT1D <- p_OTU1 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15)) + theme(legend.position='none') #  + ggtitle( paste( Tax[i]) ) +  annotate("text", label = paste("p= "), fontface = "italic", x=-5, y =2, size = 4, colour = "black") + scale_fill_manual(values=T1Dcol) + scale_color_manual(values=T1Dcol)  
+
+#Non T1D
+ordination_OTU<-ordinate(SubT1D, method="PCoA", distance="bray", ~  Time_Corr)
+p_OTU2<-plot_ordination(OTU_Plot, ordination_OTU, type="samples",  color="Time_Corr", axes = c(1, 2))
+PlotT1D <- p_OTU2 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15)) + theme(legend.position='none') #  + ggtitle( paste( Tax[i]) ) +  annotate("text", label = paste("p= "), fontface = 
+
+####Other tax levels
+for(o in 1:4){
+SubNT1DG <- subset_samples(ps_levels[[o]], t1dfactor==c("nonT1D"))
+NDT1DG <- phyloseq::distance(SubNT1DG, method="bray")
+Meta_dfNT1DG <- data.frame(sample_data(SubNT1DG), check.names = FALSE)
+
+set.seed(50)
+resultsG <- pairwise_permanova_with_covariates(
+  dist_mat = NDT1DG,
+  metadata = Meta_dfNT1DG,
+  group_var = "Time_Corr",
+  covariates = c("BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex", "Run")
+  # block_var not provided
+)
+print(resultsG)
+
+SubT1DG <- subset_samples(ps_levels[[o]], t1dfactor==c("T1D"))
+DT1DG <- phyloseq::distance(SubT1DG, method="bray")
+Meta_dfT1DG <- data.frame(sample_data(SubT1DG), check.names = FALSE)
+
+set.seed(82)
+resultsT1DG <- pairwise_permanova_with_covariates(
+  dist_mat = DT1DG,
+  metadata = Meta_dfT1DG,
+  group_var = "Time_Corr",
+  covariates = c("BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex", "Run")
+  # block_var not provided
+)
+print(resultsT1DG)
+}
+
+###T1D status within Time
+D <- phyloseq::distance(OTU_Plot, method="bray")
+Meta_df <- data.frame(sample_data(OTU_Plot), check.names = FALSE)
+
+set.seed(36)
+results <- pairwise_T1D_within_time(
+  dist_mat = D,
+  metadata = Meta_df,
+  time_var = "Time_Corr",
+  group_var = "t1dfactor",
+  covariates = c("DeliveryMode", "ParityBinary", "infant_sex", "Run", "BMI_Cat")#,
+  #subject_id = "biological_mother_id"
+)
+
+print(results)
+
+
+#Calculate CI 95%
+for(p in 1:nrow(results)){
+results[p,c("2.5%", "97.5%")] <- (CI.Rsq((round(results[p,"R2"]*100,1)), n=297, k=7))[c(3:4)]
+#Where n is the number of samples in the comparison and k is the number of predictors
+}
+results
+
+#B2
+SubB2 <- subset_samples(OTU_Plot, Time_Corr==c("B2"))
+
+ordination_OTU<-ordinate(SubB2, method="PCoA", distance="bray", ~  T1Dstatus)
+p_OTU3<-plot_ordination(OTU_Plot, ordination_OTU, type="samples",  color="T1Dstatus", axes = c(2, 3))
+PlotT1DB2 <- p_OTU3 + geom_point(size = 3)  + theme(axis.title.y = element_text(size=14), axis.title.x = element_text(size=14)) + theme(axis.text.y =element_text(size=15), axis.text.x=element_text(size=15), plot.title = element_text(size=15))  + theme(legend.title = element_text(size=15), legend.text = element_text(size=15)) + theme(legend.position='none') + scale_fill_manual(values=c("blue", "red")) + scale_color_manual(values=c("blue", "red")) + labs( x = "Axis 2 [13.9%]",   y = "Axis 3 [11.4%]")#  + ggtitle( paste( Tax[i]) ) +  annotate("text", label = paste("p= "), fontface = 
+
+##Create figure 3
+PlotBeta <- ggarrange(PlotNT1D, PlotT1D, ncol=2, labels = c("a", "b"), font.label = list(size = 20))
+PlotBeta2 <- ggarrange(PlotT1DB2, ncol=2,  labels = c("c", ""), font.label = list(size = 20), widths = c(1, 1))
+ComposedF3 <- ggarrange(PlotBeta, PlotBeta2, ncol=1,  labels = c("", "c"), font.label = list(size = 20))
+ComposedF3
+```
+
+# Differential abundance analysis
+
+
+## OTU level
+
+```{r ChDA1, echo=FALSE}
+DAanalysis <-  Mother_Milk_C_Merged # This is the unrarefied table but only leaving samples with >1000 sequences
+```
+
+```{r de1, fig.height=7, fig.width=9, echo=FALSE}
+# Metadata
+sample_data_df <- as.data.frame(sample_data(DAanalysis))
+
+# Recode mode_of_birth into a new factor DeliveryMode
+sample_data_df$DeliveryMode <- case_when(
+  sample_data_df$mode_of_birth == "Caesarean (elective)" ~ "Elective Cesarean",
+  sample_data_df$mode_of_birth == "Caesarean (emergency)" ~ "Emergency Cesarean",
+  sample_data_df$mode_of_birth == "Spontaneous (normal)" ~ "Spontaneous Vaginal",
+  sample_data_df$mode_of_birth %in% c("Ventouse (normal)", "Forceps (normal)") ~ "Assisted Vaginal",
+  TRUE ~ NA_character_  # fallback for missing or unclassified values
+)
+
+# Convert to factor and set the order of levels
+sample_data_df$DeliveryMode <- factor(sample_data_df$DeliveryMode,
+                                    levels = c("Spontaneous Vaginal",
+                                               "Assisted Vaginal",
+                                               "Elective Cesarean",
+                                               "Emergency Cesarean"))
+
+#T1D STATUS
+t1d_label <- c(`no`="nonT1D", `yes`="T1D")
+sample_data_df$t1dfactor <- factor(sample_data_df$T1Dstatus, levels=c("0","1"), labels=c("nonT1D", "T1D"))
+
+##BMI CAT
+sample_data_df$BMI_Cat <- cut(sample_data_df$pre_preg_bmi, breaks = c(-Inf,18,25,30,Inf), labels = c("Underweight", "Normal","Overweight", "Obese"))
+sample_data_df$BMI_Cat <- as.factor(sample_data_df$BMI_Cat)
+sample_data_df <- subset(sample_data_df, BMI_Cat!="NA")
+
+##INFANT SEX ##
+sample_data_df$infant_sex <- factor(sample_data_df$infant_sex)
+
+##PARITY
+sample_data_df$ParityBinary <- factor(ifelse(sample_data_df$nulliparous == 1, 
+                                          "Nulliparous", 
+                                          "Multiparous"),
+                                   levels = c("Nulliparous", "Multiparous"))
+
+#convert selected variables into factors 
+vars_to_factor <- c("t1dfactor", "Time_Corr", "BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex")
+
+# Convert selected variables to factors if they exist in the data frame
+for (var in vars_to_factor) {
+  if (var %in% colnames(sample_data_df)) {
+    sample_data_df[[var]] <- as.factor(sample_data_df[[var]])
+  }
+}
+
+sample_data_df <- sample_data_df[, c("t1dfactor", "Time_Corr", "BMI_Cat", "ParityBinary", "DeliveryMode", "infant_sex", "Run", "T1Dstatus", "biological_mother_id")]
+
+# Assign back to phyloseq object
+sample_data(DAanalysis) <- sample_data(sample_data_df)
+taxa_names(DAanalysis) <- paste(tax_table(DAanalysis)[,"Genus"], taxa_names(DAanalysis), sep=".")
+
+# Aggregate at each taxonomic level
+ps_levels <- list(
+  Genus   = tax_glom(DAanalysis, taxrank = "Genus",   NArm = TRUE),
+  Family  = tax_glom(DAanalysis, taxrank = "Family",  NArm = TRUE),
+  Order   = tax_glom(DAanalysis, taxrank = "Order",   NArm = TRUE),
+  Phylum  = tax_glom(DAanalysis, taxrank = "Phylum",  NArm = TRUE)
+)
+
+# Update taxa_names to reflect the collapsed taxonomic level
+for (level in names(ps_levels)) {
+  tax_table_obj <- tax_table(ps_levels[[level]])
+  
+  # If that level exists in the tax table
+  if (level %in% colnames(tax_table_obj)) {
+    new_names <- as.character(tax_table_obj[, level])
+    
+    # Replace NA or empty names with generic placeholders to avoid errors
+    new_names[is.na(new_names) | new_names == ""] <- paste0("Unclassified_", level, "_", seq_along(new_names[is.na(new_names) | new_names == ""]))
+    
+    # Apply new names
+    taxa_names(ps_levels[[level]]) <- new_names
+  } else {
+    warning(paste("Level", level, "not found in tax_table"))
+  }
+}
+
+#OTU
+Counts2 <- as.data.frame(t(otu_table(DAanalysis)))
+Meta <- as.matrix(sample_data(DAanalysis))
+
+#GENUS+
+#Counts2 <- as.data.frame(t(otu_table(ps_levels[[1]])))
+#Meta <- as.matrix(sample_data(ps_levels[[1]]))
+
+Meta_df <- as.data.frame(Meta)
+Meta_df$Run <- as.factor(Meta_df$Run)
+contrasts(Meta_df$Run) <- contr.sum(levels(Meta_df$Run))
+Meta_df$Time_Corr <- as.factor(Meta_df$Time_Corr)
+contrasts(Meta_df$Time_Corr) <- contr.sum(levels(Meta_df$Time_Corr))
+Meta_df$BMI_Cat <- as.factor(Meta_df$BMI_Cat)
+contrasts(Meta_df$BMI_Cat) <- contr.sum(levels(Meta_df$BMI_Cat))
+Meta_df$ParityBinary <- as.factor(Meta_df$ParityBinary)
+contrasts(Meta_df$ParityBinary) <- contr.sum(levels(Meta_df$ParityBinary))
+Meta_df$DeliveryMode <- as.factor(Meta_df$DeliveryMode)
+contrasts(Meta_df$DeliveryMode) <- contr.sum(levels(Meta_df$DeliveryMode))
+Meta_df$infant_sex <- as.factor(Meta_df$infant_sex)
+contrasts(Meta_df$infant_sex) <- contr.sum(levels(Meta_df$infant_sex))
+Meta_df$T1Dstatus <- as.factor(Meta_df$T1Dstatus)
+contrasts(Meta_df$T1Dstatus) <- contr.sum(levels(Meta_df$T1Dstatus))
+Meta_df$biological_mother_id <- as.factor(as.character(Meta_df$biological_mother_id))
+contrasts(Meta_df$biological_mother_id) <- contr.sum(levels(Meta_df$biological_mother_id))
+
+Meta_df$Time_Corr_T1Dstatus <- as.factor(paste(Meta_df$Time_Corr,Meta_df$t1dfactor, sep="."))
+contrasts(Meta_df$Time_Corr_T1Dstatus) <- contr.sum(levels(Meta_df$Time_Corr_T1Dstatus))
+```
+
+```{r de15, echo=FALSE}
+design2 <- model.matrix(~0 + Time_Corr_T1Dstatus + Run + BMI_Cat + ParityBinary + DeliveryMode + infant_sex, data=Meta_df)
+```
+
+```{r de2, fig.height=7, fig.width=9, echo=FALSE}
+col.T1Dstatus <- c("blue", "red")[Meta_df$T1Dstatus]
+dge <- DGEList(Counts2, group= Meta_df$Time_Corr_T1Dstatus)
+dgeTMM <- edgeR::calcNormFactors(dge, method = "TMMwsp")
+fit <- voomLmFit(dgeTMM, design = design2, plot = FALSE, block=Meta_df$biological_mother_id)
+```
+
+```{r de3, echo=FALSE}
+cont <- makeContrasts(T1DB1=(Time_Corr_T1DstatusB1.nonT1D-Time_Corr_T1DstatusB1.T1D), T1DB2=(Time_Corr_T1DstatusB2.nonT1D-Time_Corr_T1DstatusB2.T1D), T1DV1=(Time_Corr_T1DstatusV1.nonT1D-Time_Corr_T1DstatusV1.T1D), T1DV2=(Time_Corr_T1DstatusV2.nonT1D-Time_Corr_T1DstatusV2.T1D), T1DV3=(Time_Corr_T1DstatusV3.nonT1D-Time_Corr_T1DstatusV3.T1D), T1DV4=(Time_Corr_T1DstatusV4.nonT1D-Time_Corr_T1DstatusV4.T1D), T1DV5=(Time_Corr_T1DstatusV5.nonT1D-Time_Corr_T1DstatusV5.T1D),  B1B2T1D=((Time_Corr_T1DstatusB1.T1D) - (Time_Corr_T1DstatusB2.T1D)), B2V1T1D=((Time_Corr_T1DstatusB2.T1D) - (Time_Corr_T1DstatusV1.T1D)), V1V2T1D=((Time_Corr_T1DstatusV1.T1D) - (Time_Corr_T1DstatusV2.T1D)),  V2V3T1D=((Time_Corr_T1DstatusV2.T1D) - (Time_Corr_T1DstatusV3.T1D)), V3V4T1D=((Time_Corr_T1DstatusV3.T1D) - (Time_Corr_T1DstatusV4.T1D)), V4V5T1D=((Time_Corr_T1DstatusV4.T1D) - (Time_Corr_T1DstatusV5.T1D)), B1B2NT1D=((Time_Corr_T1DstatusB1.nonT1D) - (Time_Corr_T1DstatusB2.nonT1D)), B2V1NT1D=((Time_Corr_T1DstatusB2.nonT1D) - (Time_Corr_T1DstatusV1.nonT1D)), V1V2NT1D=((Time_Corr_T1DstatusV1.nonT1D) - (Time_Corr_T1DstatusV2.nonT1D)),  V2V3NT1D=((Time_Corr_T1DstatusV2.nonT1D) - (Time_Corr_T1DstatusV3.nonT1D)), V3V4NT1D=((Time_Corr_T1DstatusV3.nonT1D) - (Time_Corr_T1DstatusV4.nonT1D)), V4V5NT1D=((Time_Corr_T1DstatusV4.nonT1D) - (Time_Corr_T1DstatusV5.nonT1D)), levels=design2)
+
+fitc <- contrasts.fit(fit, contrasts = cont)
+fitc <- eBayes(fitc, robust=TRUE)
+DT<- decideTests(fitc)
+S <- summary(DT)
+S
+```
+
+### Taxa that significantly differ from B1 to B2 Time_Corr point
+
+```{r B1B2, echo=FALSE, fig.height=6, fig.width=14}
+##NON-T1D
+#B1 vs B2
+tt_B1_vs_B2NT <- topTable(fitc, coef = "B1B2NT1D", n=Inf, confint = T)
+DA_GG <- (row.names(tt_B1_vs_B2NT))[tt_B1_vs_B2NT$adj.P.Val<0.1]
+DA_B1B2 <- prune_taxa(DA_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DA_B1B2))[,2:6]
+B1B2_G <- cbind(tt_B1_vs_B2NT[DA_GG,][order(rownames(tt_B1_vs_B2NT[DA_GG,])),], Tax[order(rownames(Tax)),])
+B1B2_G$Comparison <-rep("B1B2NT1D", times =  nrow(B1B2_G))
+StatResults <- B1B2_G
+SigTaxa <- DA_GG
+
+#B2 vs V1
+tt_B2_vs_V1NT <- topTable(fitc, coef = "B2V1NT1D", n=Inf, confint = T)
+DA_GG <- (row.names(tt_B2_vs_V1NT))[tt_B2_vs_V1NT$adj.P.Val<0.1]
+DA_B2V1 <- prune_taxa(DA_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DA_B2V1))[,2:6]
+B2V1_G <- cbind(tt_B2_vs_V1NT[DA_GG,][order(rownames(tt_B2_vs_V1NT[DA_GG,])),], Tax[order(rownames(Tax)),])
+B2V1_G$Comparison <-rep("B2V1NT1D", times =  nrow(B2V1_G))
+StatResults <- rbind(StatResults, B2V1_G)
+SigTaxa <- c(SigTaxa, DA_GG)
+
+#V1 vs V2
+tt_V1_vs_V2NT <- topTable(fitc, coef = "V1V2NT1D", n=Inf, confint = T)
+DA_GG <- (row.names(tt_V1_vs_V2NT))[tt_V1_vs_V2NT$adj.P.Val<0.1]
+DA_V1V2 <- prune_taxa(DA_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DA_V1V2))[,2:6]
+V1V2_G <- cbind(tt_V1_vs_V2NT[DA_GG,][order(rownames(tt_V1_vs_V2NT[DA_GG,])),], Tax[order(rownames(Tax)),])
+V1V2_G$Comparison <-rep("V1V2NT1D", times =  nrow(V1V2_G))
+StatResults <- rbind(StatResults, V1V2_G)
+SigTaxa <- c(SigTaxa, DA_GG)
+
+#V2 vs V3
+tt_V2_vs_V3NT <- topTable(fitc, coef = "V2V3NT1D", n=Inf, confint = T)
+DA_GG <- (row.names(tt_V2_vs_V3NT))[tt_V2_vs_V3NT$adj.P.Val<0.1]
+DA_V2V3 <- prune_taxa(DA_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DA_V2V3))[,2:6]
+V2V3_G <- cbind(tt_V2_vs_V3NT[DA_GG,][order(rownames(tt_V2_vs_V3NT[DA_GG,])),], Tax[order(rownames(Tax)),])
+V2V3_G$Comparison <-rep("V2V3NT1D", times =  nrow(V2V3_G))
+StatResults <- rbind(StatResults, V2V3_G)
+SigTaxa <- c(SigTaxa, DA_GG)
+
+#V3 vs V4
+tt_V3_vs_V4NT <- topTable(fitc, coef = "V3V4NT1D", n=Inf, confint = T)
+DA_GG <- (row.names(tt_V3_vs_V4NT))[tt_V3_vs_V4NT$adj.P.Val<0.1]
+#DA_V3V4 <- prune_taxa(DA_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+#Tax <- data.frame(tax_table(DA_V3V4))[,2:6]
+#V3V4_G <- cbind(tt_V3_vs_V4NT[DA_GG,][order(rownames(tt_V3_vs_V4NT[DA_GG,])),], Tax[order(rownames(Tax)),])
+#V3V4_G$Comparison <-rep("V3V4NT1D", times =  nrow(V3V4_G))
+#StatResults <- rbind(StatResults, V3V4_G)
+SigTaxa <- c(SigTaxa, DA_GG)
+
+#V4 vs V5
+tt_V4_vs_V5NT <- topTable(fitc, coef = "V4V5NT1D", n=Inf, confint = T)
+DA_GG <- (row.names(tt_V4_vs_V5NT))[tt_V4_vs_V5NT$adj.P.Val<0.1]
+#DA_V4V5 <- prune_taxa(DA_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+#Tax <- data.frame(tax_table(DA_V4V5))[,2:6]
+#V4V5_G <- cbind(tt_V4_vs_V5NT[DA_GG,][order(rownames(tt_V4_vs_V5NT[DA_GG,])),], Tax[order(rownames(Tax)),])
+#V4V5_G$Comparison <-rep("V4V5NT1D", times =  nrow(V4V5_G))
+#StatResults <- rbind(StatResults, V4V5_G)
+SigTaxa <- c(SigTaxa, DA_GG)
+
+##T1D
+#B1 vs B2
+tt_B1_vs_B2T1D <- topTable(fitc, coef = "B1B2T1D", n=Inf, confint = T)
+DAT1D_GG <- (row.names(tt_B1_vs_B2T1D))[tt_B1_vs_B2T1D$adj.P.Val<0.1]
+#DAT1D_B1B2 <- prune_taxa(DAT1D_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+#Tax <- data.frame(tax_table(DAT1D_B1B2))[,2:6]
+#B1B2T1D <- cbind(tt_B1_vs_B2T1D[DAT1D_GG,][order(rownames(tt_B1_vs_B2T1D[DAT1D_GG,])),], Tax[order(rownames(Tax)),])
+#B1B2T1D$Comparison <-rep("B1B2T1D", times =  nrow(B1B2T1D))
+#StatResults <- rbind(StatResults, B1B2T1D)
+SigTaxa <- c(SigTaxa, DAT1D_GG)
+
+#B2 vs V1
+tt_B2_vs_V1T1D <- topTable(fitc, coef = "B2V1T1D", n=Inf, confint = T)
+DAT1D_GG <- (row.names(tt_B2_vs_V1T1D))[tt_B2_vs_V1T1D$adj.P.Val<0.15]
+DAT1D_B2V1 <- prune_taxa(DAT1D_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DAT1D_B2V1))[,2:6]
+B2V1T1D <- cbind(tt_B2_vs_V1T1D[DAT1D_GG,][order(rownames(tt_B2_vs_V1T1D[DAT1D_GG,])),], Tax[order(rownames(Tax)),])
+B2V1T1D$Comparison <-rep("B2V1T1D", times =  nrow(B2V1T1D))
+StatResults <- rbind(StatResults, B2V1T1D)
+SigTaxa <- c(SigTaxa, DAT1D_GG)
+
+#V1 vs V2
+tt_V1_vs_V2T1D <- topTable(fitc, coef = "V1V2T1D", n=Inf, confint = T)
+DAT1D_GG <- (row.names(tt_V1_vs_V2T1D))[tt_V1_vs_V2T1D$adj.P.Val<0.1]
+DAT1D_V1V2 <- prune_taxa(DAT1D_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DAT1D_V1V2))[,2:6]
+V1V2T1D <- cbind(tt_V1_vs_V2T1D[DAT1D_GG,][order(rownames(tt_V1_vs_V2T1D[DAT1D_GG,])),], Tax[order(rownames(Tax)),])
+V1V2T1D$Comparison <-rep("V1V2T1D", times =  nrow(V1V2T1D))
+StatResults <- rbind(StatResults, V1V2T1D)
+SigTaxa <- c(SigTaxa, DAT1D_GG)
+
+#V2 vs V3
+tt_V2_vs_V3T1D <- topTable(fitc, coef = "V2V3T1D", n=Inf, confint = T)
+DAT1D_GG <- (row.names(tt_V2_vs_V3T1D))[tt_V2_vs_V3T1D$adj.P.Val<0.15]
+DAT1D_V2V3 <- prune_taxa(DAT1D_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DAT1D_V2V3))[,2:6]
+V2V3T1D <- cbind(tt_V2_vs_V3T1D[DAT1D_GG,][order(rownames(tt_V2_vs_V3T1D[DAT1D_GG,])),], Tax[order(rownames(Tax)),])
+V2V3T1D$Comparison <-rep("V2V3T1D", times =  nrow(V2V3T1D))
+StatResults <- rbind(StatResults, V2V3T1D)
+SigTaxa <- c(SigTaxa, DAT1D_GG)
+
+#V3 vs V4
+tt_V3_vs_V4T1D <- topTable(fitc, coef = "V3V4T1D", n=Inf,  confint = T)
+DAT1D_GG <- (row.names(tt_V3_vs_V4T1D))[tt_V3_vs_V4T1D$adj.P.Val<0.1]
+#DAT1D_V3V4 <- prune_taxa(DAT1D_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+#Tax <- data.frame(tax_table(DAT1D_V3V4))[,2:6]
+#V3V4T1D <- cbind(tt_V3_vs_V4T1D[DAT1D_GG,][order(rownames(tt_V3_vs_V4T1D[DAT1D_GG,])),], Tax[order(rownames(Tax)),])
+#V3V4T1D$Comparison <-rep("V3V4T1D", times =  nrow(V3V4T1D))
+#StatResults <- rbind(StatResults, V3V4T1D)
+SigTaxa <- c(SigTaxa, DAT1D_GG)
+
+#V4 vs V5
+tt_V4_vs_V5T1D <- topTable(fitc, coef = "V4V5T1D", n=Inf, confint = T)
+DAT1D_GG <- (row.names(tt_V4_vs_V5T1D))[tt_V4_vs_V5T1D$adj.P.Val<0.1]
+#DAT1D_V4V5 <- prune_taxa(DAT1D_GG, DAanalysis)
+#Genus+
+#DA_B1B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+#Tax <- data.frame(tax_table(DAT1D_V4V5))[,2:6]
+#V4V5T1D <- cbind(tt_V4_vs_V5T1D[DAT1D_GG,][order(rownames(tt_V4_vs_V5T1D[DAT1D_GG,])),], Tax[order(rownames(Tax)),])
+#V4V5T1D$Comparison <-rep("V4V5T1D", times =  nrow(V4V5T1D))
+#StatResults <- rbind(StatResults, V4V5T1D)
+SigTaxa <- c(SigTaxa, DAT1D_GG)
+
+SigTaxaU <-unique(sort(SigTaxa))
+
+Mean <- data.frame(fit$coef[SigTaxaU,c(1:14)])
+colnames(Mean)[1:14] <- c("MEAN:NT1D_B1", "MEAN:T1D_B1", "MEAN:NT1D_B2", "MEAN:T1D_B2", "MEAN:NT1D_V1", "MEAN:T1D_V1", "MEAN:NT1D_V2", "MEAN:T1D_V2", "MEAN:NT1D_V3", "MEAN:T1D_V3", "MEAN:NT1D_V4", "MEAN:T1D_V4", "MEAN:NT1D_V5", "MEAN:T1D_V5")
+SE <- fit$stdev.unscaled * sqrt(fitc$s2.post)
+SE <- data.frame(SE[SigTaxaU,c(1:14)])
+colnames(SE)[1:14] <- c("SE:NT1D_B1", "SE:T1D_B1", "SE:NT1D_B2", "SE:T1D_B2", "SE:NT1D_V1", "SE:T1D_V1", "SE:NT1D_V2", "SE:T1D_V2", "SE:NT1D_V3", "SE:T1D_V3", "SE:NT1D_V4", "SE:T1D_V4", "SE:NT1D_V5", "SE:T1D_V5")
+DataDAplot <- cbind(Mean, SE)
+DataDAplot$Taxa <- rownames(DataDAplot)
+
+##PLOT (Rothia.18a3070630b1bcbb1d7b6ec0253a2546, Streptococcus.01a7b4a75ae2c2d5c52282a44e78f0eb, Streptococcus.bf0a5e99cb2470e070686ca4a5cd102d)
+DataDAplotSel <- DataDAplot[c("Rothia.18a3070630b1bcbb1d7b6ec0253a2546", "Streptococcus.01a7b4a75ae2c2d5c52282a44e78f0eb", "Streptococcus.bf0a5e99cb2470e070686ca4a5cd102d"),]
+
+X <- reshape2::melt(DataDAplotSel, "Taxa")
+Y <- data.frame(str_split_fixed(X$variable, ":", 2))
+Z <- cbind(X[1], Y, X[3])
+#B <- Z[(length(DataDAplot)+1):length(Z$Taxa),]
+A <- data.frame(str_split_fixed(Z$X2, "_", 2))
+colnames(A) <- c("T1Dstatus", "Time_Corr")
+C <- cbind(Z,A)
+C <- C[order(C$Taxa),]
+NC <- unique(C$Taxa)
+
+g <- length((C[C$Taxa==NC[1],])$Taxa)
+PP <- C[1:g,c(2:6)]
+PP2 <- reshape2::dcast(PP, X2 + T1Dstatus + Time_Corr ~ X1)
+rownames(PP2) <- PP2$X2
+PP2 <- PP2[,c(2:5)]
+pd <- position_dodge(0.1)
+p2 <- ggplot(PP2, aes(x=Time_Corr, y=MEAN, colour=T1Dstatus, group=T1Dstatus))
+J <-  p2 + geom_errorbar(aes(ymin=MEAN-SE, ymax=MEAN+SE), width=.1, position=pd) + geom_line(position=pd, size=1.5) + geom_point(position=pd, size=3, shape=21, fill="white") + theme(axis.title.x = element_blank(), axis.title.y = element_blank()) + theme(axis.text.y =element_text(size=14,color = "black"), axis.text.x =element_text(size=14,color = "black")) + theme(legend.title = element_text(size=7, face="bold")) + scale_fill_manual(values=T1Dcol) + scale_color_manual(values=T1Dcol) + theme(legend.position='none')  + ggtitle(NC[1]) # + theme(plot.title = element_text(face = "italic")) + scale_y_continuous(labels = scales::number_format(accuracy = 0.1))
+J1 <- J + geom_text(aes(x = 1.5, y = 13.5, label = "*"), size = 8, color = "blue", fontface = "bold") + geom_text(aes(x = 2.5, y = 12.5, label = "*"), size = 8, color = "red", fontface = "bold") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())  + labs(y = expression(log[2]~"transformed fitted value")) + theme(axis.title.y = element_text(size = 14),axis.title.x = element_text(size = 14))  + theme(axis.title.x = element_blank()) + ggtitle(expression(bolditalic(Rothia)~"(OTU3)")) +
+  theme(plot.title = element_text(size = 16, hjust = 0.5))
+J1
+
+PP <- C[c(29:56),c(2:6)]
+PP2 <- reshape2::dcast(PP, X2 + T1Dstatus + Time_Corr ~ X1)
+rownames(PP2) <- PP2$X2
+PP2 <- PP2[,c(2:5)]
+pd <- position_dodge(0.1)
+p2 <- ggplot(PP2, aes(x=Time_Corr, y=MEAN, colour=T1Dstatus, group=T1Dstatus))
+J <-  p2 + geom_errorbar(aes(ymin=MEAN-SE, ymax=MEAN+SE), width=.1, position=pd) + geom_line(position=pd, size=1.5) + geom_point(position=pd, size=3, shape=21, fill="white") + theme(axis.text.y =element_text(size=14,color = "black"), axis.text.x =element_text(size=14,color = "black")) + theme(legend.title = element_text(size=7, face="bold")) + scale_fill_manual(values=T1Dcol) + scale_color_manual(values=T1Dcol) + theme(legend.position='none') # + ggtitle(NC[2])#  + theme(plot.title = element_text(face = "italic")) + scale_y_continuous(labels = scales::number_format(accuracy = 0.1))
+J2 <- J + geom_text(aes(x = 1.5, y = 11.5, label = "*"), size = 8, color = "blue", fontface = "bold") + geom_text(aes(x = 2.5, y = 15, label = "*"), size = 8, color = "blue", fontface = "bold") + geom_text(aes(x = 2.5, y = 11.5, label = "*"), size = 8, color = "red", fontface = "bold") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + labs(y = expression(log[2]~"transformed fitted value")) + theme(axis.title.y = element_text(size = 14),axis.title.x = element_text(size = 14))  + theme(axis.title.x = element_blank()) + ggtitle(expression(bolditalic(Streptococcus )~"(OTU1)")) +
+  theme(plot.title = element_text(size = 16, hjust = 0.5))
+J2
+
+PP <- C[c(57:84),c(2:6)]
+PP2 <- reshape2::dcast(PP, X2 + T1Dstatus + Time_Corr ~ X1)
+rownames(PP2) <- PP2$X2
+PP2 <- PP2[,c(2:5)]
+pd <- position_dodge(0.1)
+p2 <- ggplot(PP2, aes(x=Time_Corr, y=MEAN, colour=T1Dstatus, group=T1Dstatus))
+J <-  p2 + geom_errorbar(aes(ymin=MEAN-SE, ymax=MEAN+SE), width=.1, position=pd) + geom_line(position=pd, size=1.5) + geom_point(position=pd, size=3, shape=21, fill="white") + theme(axis.title.x = element_blank(), axis.title.y = element_blank()) + theme(axis.text.y =element_text(size=14,color = "black"), axis.text.x =element_text(size=14,color = "black")) + theme(legend.title = element_text(size=7, face="bold")) + scale_fill_manual(values=T1Dcol) + scale_color_manual(values=T1Dcol) + theme(legend.position='none')  + ggtitle(NC[3])  #+ theme(plot.title = element_text(face = "italic")) + scale_y_continuous(labels = scales::number_format(accuracy = 0.1))
+J3 <- J + geom_text(aes(x = 1.5, y = 13.5, label = "*"), size = 8, color = "blue", fontface = "bold") + geom_text(aes(x = 2.5, y = 12.5, label = "*"), size = 8, color = "red", fontface = "bold")+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+ labs(y = expression(log[2]~"transformed fitted value")) + theme(axis.title.y = element_text(size = 14),axis.title.x = element_text(size = 14))  + theme(axis.title.x = element_blank()) + ggtitle(expression(bolditalic(Streptococcus )~"(OTU2)")) +
+  theme(plot.title = element_text(size = 16, hjust = 0.5))
+J3
+
+##Create figure 4
+PlotDA <- ggarrange(J2, J3, ncol=2, labels = c("a", "b"), font.label = list(size = 20))
+PlotDA2 <- ggarrange(J1, ncol=2,  labels = c("c", ""), font.label = list(size = 20), widths = c(1, 1))
+ComposedF4 <- ggarrange(PlotDA, PlotDA2, ncol=1,  labels = c("c", ""), font.label = list(size = 20), widths = c(1, 1))
+ComposedF4
+
+
+#DA between women with and without T1D in each timepoint
+tt_B1 <- topTable(fitc, coef = "T1DB1", n=Inf, confint = T)
+DA_GGB1 <- (row.names(tt_B1))[tt_B1$adj.P.Val<0.1]
+
+tt_B2 <- topTable(fitc, coef = "T1DB2", n=Inf, confint = T)
+DA_GGB2 <- (row.names(tt_B2))[tt_B2$adj.P.Val<0.1]
+
+tt_V1 <- topTable(fitc, coef = "T1DV1", n=Inf, confint = T)
+DA_GGV1 <- (row.names(tt_V1))[tt_V1$adj.P.Val<0.1]
+
+tt_V2 <- topTable(fitc, coef = "T1DV2", n=Inf, confint = T)
+DA_GGV2 <- (row.names(tt_V2))[tt_V2$adj.P.Val<0.1]
+
+tt_V3 <- topTable(fitc, coef = "T1DV3", n=Inf, confint = T)
+DA_GGV3 <- (row.names(tt_V3))[tt_V3$adj.P.Val<0.1]
+
+tt_V4 <- topTable(fitc, coef = "T1DV4", n=Inf, confint = T)
+DA_GGV4 <- (row.names(tt_V4))[tt_V4$adj.P.Val<0.1]
+
+tt_V5 <- topTable(fitc, coef = "T1DV5", n=Inf, confint = T)
+DA_GGV4 <- (row.names(tt_V5))[tt_V5$adj.P.Val<0.1]
+
+
+##B2 Genus+
+tt_B2 <- topTable(fitc, coef = "T1DB2", n=Inf, confint = T)
+DA_GG <- (row.names(tt_B2))[tt_B2$adj.P.Val<0.1]
+DA_B2 <- prune_taxa(DA_GG, ps_levels[[1]])
+Tax <- data.frame(tax_table(DA_B2))[,2:6]
+DA_B2_G <- cbind(tt_B2[DA_GG,][order(rownames(tt_B2[DA_GG,])),], Tax[order(rownames(Tax)),])
+DA_B2_G$Comparison <-rep("T1DB2", times =  nrow(DA_B2_G))
+StatResults <- DA_B2_G
+SigTaxa <- DA_GG
+```
+
+
