@@ -54,7 +54,7 @@ The documents containing the R code for the different runs’ formatting (3 file
 
 - Run_22_Milk_Features_Phyloseq_Obj_Unfiltered.RData
 
-### 4) Milk_microbiome_statistical_analysis_wNew_Metadata upload.Rmd
+### 4) Milk_microbiome_statistical_analysis_wNew_Metadata upload.Rmd 
 
 #### Contains the code used to analyse the alpha and beta diversity and differential abundance of the breast milk microbiome in the context of T1D status and collection timepoint. Input data:
 
@@ -69,3 +69,14 @@ The documents containing the R code for the different runs’ formatting (3 file
 
 - All_Runs_Milk_OTU_Phyloseq_Obj_Filter1.RData: This contains the phyloseq object containing all samples in runs 11, 16 and 22 together with taxonomy and metadata agglomerated to a Copernic distance of h=0.03 (“species level”) and for which all OTUs below relative abundance of 0.01% were removed. This file was used to continue the statistical analysis. From here, everything else in within the Markdown R code.
 
+#### Note: Milk_microbiome_statistical_analysis_wNew_Metadata upload_CompleteAnalysis.Rmd is the updated version of Milk_microbiome_statistical_analysis_wNew_Metadata upload.Rmd, it has extra analysis derived from the referees questions. 
+
+### 5) Infant_gut_from_mothers_analysis_upload.rmd
+
+#### Contains the analysis performed on infant stool samples from the mothers included in the original milk microbiome analysis, which was also derived from a referees comment.
+
+- Tab_All_InfantGut_wTax.biom: contains the ASV per samples table from infant stool samples from mothers included in the milk microbiome analysis. 
+- Mapping_All_InfantGut_woBoStd.txt: is the metadata for samples in Tab_All_InfantGut_wTax.biom before merging replicates and Mapping_All_InfantGut_woBoStd_Merged.txt is the metadata after merging replicates.
+- rooted-tree_All_InfantGut.nwk: is the phylogenetic three derived from the sequences from the infant stool samples
+- RepS_RunAll_InfantGut.fasta: is the fasta file with representative sequences from the infant stool samples.
+- All_InfantGut_OTU_Phyloseq_Obj_Filter1.RData: this contains the phyloseq object from the infant stool samples after applying decontamination filters.
